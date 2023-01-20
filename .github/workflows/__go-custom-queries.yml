@@ -7,12 +7,12 @@ name: 'PR Check - Go: Custom queries'
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GO111MODULE: auto
+  CODEQL_EXTRACTOR_JAVA_AGENT_DISABLE_KOTLIN: 'true'
 on:
   push:
     branches:
     - main
-    - v1
-    - v2
+    - releases/v2
   pull_request:
     types:
     - opened
@@ -25,45 +25,41 @@ jobs:
     strategy:
       matrix:
         include:
-        - os: ubuntu-latest
-          version: stable-20210308
+        - os: ubuntu-20.04
+          version: stable-20211005
         - os: macos-latest
-          version: stable-20210308
+          version: stable-20211005
         - os: windows-2019
-          version: stable-20210308
-        - os: ubuntu-latest
-          version: stable-20210319
+          version: stable-20211005
+        - os: ubuntu-20.04
+          version: stable-20220120
         - os: macos-latest
-          version: stable-20210319
+          version: stable-20220120
         - os: windows-2019
-          version: stable-20210319
+          version: stable-20220120
         - os: ubuntu-latest
-          version: stable-20210809
+          version: stable-20220401
         - os: macos-latest
-          version: stable-20210809
-        - os: windows-2019
-          version: stable-20210809
+          version: stable-20220401
+        - os: windows-latest
+          version: stable-20220401
         - os: ubuntu-latest
           version: cached
         - os: macos-latest
           version: cached
-        - os: windows-2019
+        - os: windows-latest
           version: cached
         - os: ubuntu-latest
           version: latest
         - os: macos-latest
           version: latest
-        - os: windows-2019
-          version: latest
-        - os: windows-2022
+        - os: windows-latest
           version: latest
         - os: ubuntu-latest
           version: nightly-latest
         - os: macos-latest
           version: nightly-latest
-        - os: windows-2019
-          version: nightly-latest
-        - os: windows-2022
+        - os: windows-latest
           version: nightly-latest
     name: 'Go: Custom queries'
     timeout-minutes: 45
@@ -76,7 +72,9 @@ jobs:
       uses: ./.github/prepare-test
       with:
         version: ${{ matrix.version }}
-    - uses: actions/setup-go@v3
+    - name: Set up Go
+      if: matrix.os == 'ubuntu-20.04' || matrix.os == 'windows-2019'
+      uses: actions/setup-go@v3
       with:
         go-version: ^1.13.1
     - uses: ./../action/init
@@ -88,7 +86,6 @@ jobs:
       shell: bash
       run: ./build.sh
     - uses: ./../action/analyze
-      env:
-        TEST_MODE: true
     env:
-      INTERNAL_CODEQL_ACTION_DEBUG_LOC: true
+      DOTNET_GENERATE_ASPNET_CERTIFICATE: 'false'
+      CODEQL_ACTION_TEST_MODE: true

@@ -1,9 +1,11 @@
 import * as github from "@actions/github";
 import { TestFn } from "ava";
+import * as nock from "nock";
 import * as sinon from "sinon";
 
 import * as apiClient from "./api-client";
 import * as CodeQL from "./codeql";
+import { Feature, FeatureEnablement } from "./feature-flags";
 import { Logger } from "./logging";
 import { HTTPError } from "./util";
 
@@ -63,6 +65,16 @@ export function setupTests(test: TestFn<any>) {
     t.context.stderrWrite = processStderrWrite;
     process.stderr.write = wrapOutput(t.context) as any;
 
+    // Workaround an issue in tests where the case insensitivity of the `$PATH`
+    // environment variable on Windows isn't preserved, i.e. `process.env.PATH`
+    // is not the same as `process.env.Path`.
+    const pathKeys = Object.keys(process.env).filter(
+      (k) => k.toLowerCase() === "path"
+    );
+    if (pathKeys.length > 0) {
+      process.env.PATH = process.env[pathKeys[0]];
+    }
+
     // Many tests modify environment variables. Take a copy now so that
     // we reset them after the test to keep tests independent of each other.
     // process.env only has strings fields, so a shallow copy is fine.
@@ -78,6 +90,9 @@ export function setupTests(test: TestFn<any>) {
     if (!t.passed) {
       process.stdout.write(t.context.testOutput);
     }
+
+    // Undo any modifications made by nock
+    nock.cleanAll();
 
     // Undo any modifications made by sinon
     sinon.restore();
@@ -149,4 +164,48 @@ export function mockFeatureFlagApiEndpoint(
   }
 
   sinon.stub(apiClient, "getApiClient").value(() => client);
+}
+
+export function mockLanguagesInRepo(languages: string[]) {
+  const mockClient = sinon.stub(apiClient, "getApiClient");
+  const listLanguages = sinon.stub().resolves({
+    status: 200,
+    data: languages.reduce((acc, lang) => {
+      acc[lang] = 1;
+      return acc;
+    }, {}),
+    headers: {},
+    url: "GET /repos/:owner/:repo/languages",
+  });
+
+  mockClient.returns({
+    repos: {
+      listLanguages,
+    },
+  } as any);
+  return listLanguages;
+}
+
+export function mockCodeQLVersion(version) {
+  return {
+    async getVersion() {
+      return version;
+    },
+  } as CodeQL.CodeQL;
+}
+
+/**
+ * Create a feature enablement instance with the specified set of enabled features.
+ *
+ * This should be only used within tests.
+ */
+export function createFeatures(enabledFeatures: Feature[]): FeatureEnablement {
+  return {
+    getDefaultCliVersion: async () => {
+      throw new Error("not implemented");
+    },
+    getValue: async (feature) => {
+      return enabledFeatures.includes(feature);
+    },
+  };
 }

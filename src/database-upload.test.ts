@@ -8,7 +8,7 @@ import * as actionsUtil from "./actions-util";
 import { GitHubApiDetails } from "./api-client";
 import * as apiClient from "./api-client";
 import { setCodeQL } from "./codeql";
-import { Config } from "./config-utils";
+import { Config, defaultAugmentationProperties } from "./config-utils";
 import { uploadDatabases } from "./database-upload";
 import { Language } from "./languages";
 import { RepositoryNwo } from "./repository";
@@ -24,20 +24,20 @@ import {
   GitHubVariant,
   HTTPError,
   initializeEnvironment,
-  Mode,
   withTmpDir,
 } from "./util";
 
 setupTests(test);
 
 test.beforeEach(() => {
-  initializeEnvironment(Mode.actions, "1.2.3");
+  initializeEnvironment("1.2.3");
 });
 
 const testRepoName: RepositoryNwo = { owner: "github", repo: "example" };
 const testApiDetails: GitHubApiDetails = {
   auth: "1234",
   url: "https://github.com",
+  apiURL: undefined,
 };
 
 function getTestConfig(tmpDir: string): Config {
@@ -48,7 +48,6 @@ function getTestConfig(tmpDir: string): Config {
     paths: [],
     originalUserInput: {},
     tempDir: tmpDir,
-    toolCacheDir: tmpDir,
     codeQLCmd: "foo",
     gitHubVersion: { type: GitHubVariant.DOTCOM },
     dbLocation: tmpDir,
@@ -56,7 +55,9 @@ function getTestConfig(tmpDir: string): Config {
     debugMode: false,
     debugArtifactName: DEFAULT_DEBUG_ARTIFACT_NAME,
     debugDatabaseName: DEFAULT_DEBUG_DATABASE_NAME,
-    injectedMlQueries: false,
+    augmentationProperties: defaultAugmentationProperties,
+    trapCaches: {},
+    trapCacheDownloadTime: 0,
   };
 }
 

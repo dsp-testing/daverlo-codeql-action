@@ -10,5 +10,3 @@ steps:
     shell: bash
     run: ./build.sh
   - uses: ./../action/analyze
-    env:
-      TEST_MODE: true

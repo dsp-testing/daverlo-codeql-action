@@ -1,9 +1,5 @@
 name: "Use a custom `checkout_path`"
 description: "Checks that a custom `checkout_path` will find the proper commit_oid"
-# Build tracing currently does not support Windows 2022, so use `windows-2019` instead of
-# `windows-latest`.
-# Must test on all three platforms since this test does path manipulation
-os: [ubuntu-latest, macos-latest, windows-2019]
 steps:
   # Check out the actions repo again, but at a different location.
   # choose an arbitrary SHA so that we can later test that the commit_oid is not from main
@@ -34,16 +30,12 @@ steps:
       ref: v1.1.0
       sha: 474bbf07f9247ffe1856c6a0f94aeeb10e7afee6
       upload: false
-    env:
-      TEST_MODE: true
 
   - uses: ./../action/upload-sarif
     with:
       ref: v1.1.0
       sha: 474bbf07f9247ffe1856c6a0f94aeeb10e7afee6
       checkout_path: x/y/z/some-path/tests/multi-language-repo
-    env:
-      TEST_MODE: true
 
   - name: Verify SARIF after upload
     shell: bash

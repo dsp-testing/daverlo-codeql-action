@@ -13,5 +13,3 @@ steps:
     with:
       ref: 'refs/heads/main'
       sha: '5e235361806c361d4d3f8859e3c897658025a9a2'
-    env:
-      TEST_MODE: true

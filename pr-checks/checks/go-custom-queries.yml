@@ -1,9 +1,8 @@
 name: "Go: Custom queries"
 description: "Checks that Go works in conjunction with a config file specifying custom queries"
+env: 
+  DOTNET_GENERATE_ASPNET_CERTIFICATE: "false"
 steps:
-  - uses: actions/setup-go@v3
-    with:
-      go-version: "^1.13.1"
   - uses: ./../action/init
     with:
       languages: go
@@ -13,5 +12,3 @@ steps:
     shell: bash
     run: ./build.sh
   - uses: ./../action/analyze
-    env:
-      TEST_MODE: true

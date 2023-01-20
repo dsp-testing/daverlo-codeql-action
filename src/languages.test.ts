@@ -20,10 +20,15 @@ test("parseLanguage", async (t) => {
   t.deepEqual(parseLanguage("python"), Language.python);
 
   // Aliases
-  t.deepEqual(parseLanguage("c"), Language.cpp);
-  t.deepEqual(parseLanguage("c++"), Language.cpp);
-  t.deepEqual(parseLanguage("c#"), Language.csharp);
-  t.deepEqual(parseLanguage("typescript"), Language.javascript);
+  t.deepEqual(parseLanguage("c"), "c");
+  t.deepEqual(parseLanguage("c++"), "c++");
+  t.deepEqual(parseLanguage("c#"), "c#");
+  t.deepEqual(parseLanguage("kotlin"), "kotlin");
+  t.deepEqual(parseLanguage("typescript"), "typescript");
+
+  // spaces and case-insensitivity
+  t.deepEqual(parseLanguage("  \t\nCsHaRp\t\t"), Language.csharp);
+  t.deepEqual(parseLanguage("  \t\nkOtLin\t\t"), "kotlin");
 
   // Not matches
   t.deepEqual(parseLanguage("foo"), undefined);
@@ -33,20 +38,24 @@ test("parseLanguage", async (t) => {
 
 test("isTracedLanguage", async (t) => {
   t.true(isTracedLanguage(Language.cpp));
-  t.true(isTracedLanguage(Language.java));
   t.true(isTracedLanguage(Language.csharp));
+  t.true(isTracedLanguage(Language.go));
+  t.true(isTracedLanguage(Language.java));
+  t.true(isTracedLanguage(Language.swift));
 
-  t.false(isTracedLanguage(Language.go));
   t.false(isTracedLanguage(Language.javascript));
   t.false(isTracedLanguage(Language.python));
+  t.false(isTracedLanguage(Language.ruby));
 });
 
 test("isScannedLanguage", async (t) => {
   t.false(isScannedLanguage(Language.cpp));
-  t.false(isScannedLanguage(Language.java));
   t.false(isScannedLanguage(Language.csharp));
+  t.false(isScannedLanguage(Language.go));
+  t.false(isScannedLanguage(Language.java));
+  t.false(isScannedLanguage(Language.swift));
 
-  t.true(isScannedLanguage(Language.go));
   t.true(isScannedLanguage(Language.javascript));
   t.true(isScannedLanguage(Language.python));
+  t.true(isScannedLanguage(Language.ruby));
 });

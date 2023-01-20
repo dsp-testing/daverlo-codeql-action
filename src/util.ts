@@ -1,18 +1,28 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { Readable } from "stream";
+import { promisify } from "util";
 
 import * as core from "@actions/core";
 import del from "del";
+import getFolderSize from "get-folder-size";
 import * as semver from "semver";
 
 import { getApiClient, GitHubApiDetails } from "./api-client";
 import * as apiCompatibility from "./api-compatibility.json";
 import { CodeQL, CODEQL_VERSION_NEW_TRACING } from "./codeql";
-import { Config, PackWithVersion } from "./config-utils";
-import { Language } from "./languages";
+import {
+  Config,
+  getLanguagesInRepo,
+  getRawLanguages,
+  parsePacksSpecification,
+  prettyPrintPack,
+} from "./config-utils";
+import { Feature, FeatureEnablement } from "./feature-flags";
+import { KOTLIN_SWIFT_BYPASS, Language } from "./languages";
 import { Logger } from "./logging";
+import { RepositoryNwo } from "./repository";
+import { CODEQL_ACTION_TEST_MODE } from "./shared-environment";
 
 /**
  * Specifies bundle versions that are known to be broken
@@ -35,23 +45,37 @@ export const DEFAULT_DEBUG_ARTIFACT_NAME = "debug-artifacts";
  */
 export const DEFAULT_DEBUG_DATABASE_NAME = "db";
 
+/**
+ * Environment variable that is set to "true" when the CodeQL Action has invoked
+ * the Go autobuilder.
+ */
+export const DID_AUTOBUILD_GO_ENV_VAR_NAME =
+  "CODEQL_ACTION_DID_AUTOBUILD_GOLANG";
+
 export interface SarifFile {
   version?: string | null;
-  runs: Array<{
-    tool?: {
-      driver?: {
-        name?: string;
-      };
+  runs: SarifRun[];
+}
+
+export interface SarifRun {
+  tool?: {
+    driver?: {
+      name?: string;
+      semanticVersion?: string;
     };
-    automationDetails?: {
-      id?: string;
-    };
-    artifacts?: string[];
-    results?: SarifResult[];
-  }>;
+  };
+  automationDetails?: {
+    id?: string;
+  };
+  artifacts?: string[];
+  results?: SarifResult[];
 }
 
 export interface SarifResult {
+  ruleId?: string;
+  message?: {
+    text?: string;
+  };
   locations: Array<{
     physicalLocation: {
       artifactLocation: {
@@ -111,11 +135,7 @@ export async function withTmpDir<T>(
   body: (tmpDir: string) => Promise<T>
 ): Promise<T> {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codeql-action-"));
-  const realSubdir = path.join(tmpDir, "real");
-  fs.mkdirSync(realSubdir);
-  const symlinkSubdir = path.join(tmpDir, "symlink");
-  fs.symlinkSync(realSubdir, symlinkSubdir, "dir");
-  const result = await body(symlinkSubdir);
+  const result = await body(tmpDir);
   await del(tmpDir, { force: true });
   return result;
 }
@@ -311,7 +331,7 @@ export async function getGitHubVersion(
 
   // Doesn't strictly have to be the meta endpoint as we're only
   // using the response headers which are available on every request.
-  const apiClient = getApiClient(apiDetails);
+  const apiClient = getApiClient();
   const response = await apiClient.meta.get();
 
   // This happens on dotcom, although we expect to have already returned in that
@@ -330,8 +350,7 @@ export async function getGitHubVersion(
 
 export function checkGitHubVersionInRange(
   version: GitHubVersion,
-  logger: Logger,
-  toolName: Mode
+  logger: Logger
 ) {
   if (hasBeenWarnedAboutVersion || version.type !== GitHubVariant.GHES) {
     return;
@@ -347,20 +366,18 @@ export function checkGitHubVersionInRange(
     disallowedAPIVersionReason === DisallowedAPIVersionReason.ACTION_TOO_OLD
   ) {
     logger.warning(
-      `The CodeQL ${toolName} version you are using is too old to be compatible with GitHub Enterprise ${version.version}. If you experience issues, please upgrade to a more recent version of the CodeQL ${toolName}.`
+      `The CodeQL Action version you are using is too old to be compatible with GitHub Enterprise ${version.version}. If you experience issues, please upgrade to a more recent version of the CodeQL Action.`
     );
   }
   if (
     disallowedAPIVersionReason === DisallowedAPIVersionReason.ACTION_TOO_NEW
   ) {
     logger.warning(
-      `GitHub Enterprise ${version.version} is too old to be compatible with this version of the CodeQL ${toolName}. If you experience issues, please upgrade to a more recent version of GitHub Enterprise or use an older version of the CodeQL ${toolName}.`
+      `GitHub Enterprise ${version.version} is too old to be compatible with this version of the CodeQL Action. If you experience issues, please upgrade to a more recent version of GitHub Enterprise or use an older version of the CodeQL Action.`
     );
   }
   hasBeenWarnedAboutVersion = true;
-  if (isActions()) {
-    core.exportVariable(CODEQL_ACTION_WARNED_ABOUT_VERSION_ENV_VAR, true);
-  }
+  core.exportVariable(CODEQL_ACTION_WARNED_ABOUT_VERSION_ENV_VAR, true);
 }
 
 export enum DisallowedAPIVersionReason {
@@ -383,71 +400,6 @@ export function apiVersionInRange(
 }
 
 /**
- * Retrieves the github auth token for use with the runner. There are
- * three possible locations for the token:
- *
- * 1. from the cli (considered insecure)
- * 2. from stdin
- * 3. from the GITHUB_TOKEN environment variable
- *
- * If both 1 & 2 are specified, then an error is thrown.
- * If 1 & 3 or 2 & 3 are specified, then the environment variable is ignored.
- *
- * @param githubAuth a github app token or PAT
- * @param fromStdIn read the github app token or PAT from stdin up to, but excluding the first whitespace
- * @param readable the readable stream to use for getting the token (defaults to stdin)
- *
- * @return a promise resolving to the auth token.
- */
-export async function getGitHubAuth(
-  logger: Logger,
-  githubAuth: string | undefined,
-  fromStdIn: boolean | undefined,
-  readable = process.stdin as Readable
-): Promise<string> {
-  if (githubAuth && fromStdIn) {
-    throw new Error(
-      "Cannot specify both `--github-auth` and `--github-auth-stdin`. Please use `--github-auth-stdin`, which is more secure."
-    );
-  }
-
-  if (githubAuth) {
-    logger.warning(
-      "Using `--github-auth` via the CLI is insecure. Use `--github-auth-stdin` instead."
-    );
-    return githubAuth;
-  }
-
-  if (fromStdIn) {
-    return new Promise((resolve, reject) => {
-      let token = "";
-      readable.on("data", (data) => {
-        token += data.toString("utf8");
-      });
-      readable.on("end", () => {
-        token = token.split(/\s+/)[0].trim();
-        if (token) {
-          resolve(token);
-        } else {
-          reject(new Error("Standard input is empty"));
-        }
-      });
-      readable.on("error", (err) => {
-        reject(err);
-      });
-    });
-  }
-
-  if (process.env.GITHUB_TOKEN) {
-    return process.env.GITHUB_TOKEN;
-  }
-
-  throw new Error(
-    "No GitHub authentication token was specified. Please provide a token via the GITHUB_TOKEN environment variable, or by adding the `--github-auth-stdin` flag and passing the token via standard input."
-  );
-}
-
-/**
  * This error is used to indicate a runtime failure of an exhaustivity check enforced at compile time.
  */
 class ExhaustivityCheckingError extends Error {
@@ -464,22 +416,11 @@ export function assertNever(value: never): never {
   throw new ExhaustivityCheckingError(value);
 }
 
-export enum Mode {
-  actions = "Action",
-  runner = "Runner",
-}
-
 /**
  * Environment variables to be set by codeql-action and used by the
- * CLI. These environment variables are relevant for both the runner
- * and the action.
+ * CLI.
  */
-enum EnvVar {
-  /**
-   * The mode of the codeql-action, either 'actions' or 'runner'.
-   */
-  RUN_MODE = "CODEQL_ACTION_RUN_MODE",
-
+export enum EnvVar {
   /**
    * Semver of the codeql-action as specified in package.json.
    */
@@ -511,53 +452,28 @@ enum EnvVar {
   FEATURE_SANDWICH = "CODEQL_ACTION_FEATURE_SANDWICH",
 }
 
-const exportVar = (mode: Mode, name: string, value: string) => {
-  if (mode === Mode.actions) {
-    core.exportVariable(name, value);
-  } else {
-    process.env[name] = value;
-  }
-};
-
 /**
  * Set some initial environment variables that we can set even without
  * knowing what version of CodeQL we're running.
  */
-export function initializeEnvironment(mode: Mode, version: string) {
-  exportVar(mode, EnvVar.RUN_MODE, mode);
-  exportVar(mode, EnvVar.VERSION, version);
-  exportVar(mode, EnvVar.FEATURE_SARIF_COMBINE, "true");
-  exportVar(mode, EnvVar.FEATURE_WILL_UPLOAD, "true");
+export function initializeEnvironment(version: string) {
+  core.exportVariable(EnvVar.VERSION, version);
+  core.exportVariable(EnvVar.FEATURE_SARIF_COMBINE, "true");
+  core.exportVariable(EnvVar.FEATURE_WILL_UPLOAD, "true");
 }
 
 /**
  * Enrich the environment variables with further flags that we cannot
  * know the value of until we know what version of CodeQL we're running.
  */
-export async function enrichEnvironment(mode: Mode, codeql: CodeQL) {
+export async function enrichEnvironment(codeql: CodeQL) {
   if (await codeQlVersionAbove(codeql, CODEQL_VERSION_NEW_TRACING)) {
-    exportVar(mode, EnvVar.FEATURE_MULTI_LANGUAGE, "false");
-    exportVar(mode, EnvVar.FEATURE_SANDWICH, "false");
+    core.exportVariable(EnvVar.FEATURE_MULTI_LANGUAGE, "false");
+    core.exportVariable(EnvVar.FEATURE_SANDWICH, "false");
   } else {
-    exportVar(mode, EnvVar.FEATURE_MULTI_LANGUAGE, "true");
-    exportVar(mode, EnvVar.FEATURE_SANDWICH, "true");
+    core.exportVariable(EnvVar.FEATURE_MULTI_LANGUAGE, "true");
+    core.exportVariable(EnvVar.FEATURE_SANDWICH, "true");
   }
-}
-
-export function getMode(): Mode {
-  // Make sure we fail fast if the env var is missing. This should
-  // only happen if there is a bug in our code and we neglected
-  // to set the mode early in the process.
-  const mode = getRequiredEnvParam(EnvVar.RUN_MODE);
-
-  if (mode !== Mode.actions && mode !== Mode.runner) {
-    throw new Error(`Unknown mode: ${mode}.`);
-  }
-  return mode;
-}
-
-export function isActions(): boolean {
-  return getMode() === Mode.actions;
 }
 
 /**
@@ -592,16 +508,6 @@ export class UserError extends Error {
 
 export function isHTTPError(arg: any): arg is HTTPError {
   return arg?.status !== undefined && Number.isInteger(arg.status);
-}
-
-export function isGitHubGhesVersionBelow(
-  gitHubVersion: GitHubVersion,
-  expectedVersion: string
-): boolean {
-  return (
-    gitHubVersion.type === GitHubVariant.GHES &&
-    semver.lt(gitHubVersion.version, expectedVersion)
-  );
 }
 
 let cachedCodeQlVersion: undefined | string = undefined;
@@ -662,11 +568,21 @@ export const ML_POWERED_JS_QUERIES_PACK_NAME =
  */
 export async function getMlPoweredJsQueriesPack(
   codeQL: CodeQL
-): Promise<PackWithVersion> {
-  if (await codeQlVersionAbove(codeQL, "2.8.4")) {
-    return { packName: ML_POWERED_JS_QUERIES_PACK_NAME, version: "~0.2.0" };
+): Promise<string> {
+  let version;
+  if (await codeQlVersionAbove(codeQL, "2.11.3")) {
+    version = "~0.4.0";
+  } else if (await codeQlVersionAbove(codeQL, "2.9.3")) {
+    version = `~0.3.0`;
+  } else if (await codeQlVersionAbove(codeQL, "2.8.4")) {
+    version = `~0.2.0`;
+  } else {
+    version = `~0.1.0`;
   }
-  return { packName: ML_POWERED_JS_QUERIES_PACK_NAME, version: "~0.1.0" };
+  return prettyPrintPack({
+    name: ML_POWERED_JS_QUERIES_PACK_NAME,
+    version,
+  });
 }
 
 /**
@@ -691,9 +607,12 @@ export async function getMlPoweredJsQueriesPack(
  * explanation as to why this is.
  */
 export function getMlPoweredJsQueriesStatus(config: Config): string {
-  const mlPoweredJsQueryPacks = (config.packs.javascript || []).filter(
-    (pack) => pack.packName === ML_POWERED_JS_QUERIES_PACK_NAME
-  );
+  const mlPoweredJsQueryPacks = (config.packs.javascript || [])
+    .map((p) => parsePacksSpecification(p))
+    .filter(
+      (pack) =>
+        pack.name === "codeql/javascript-experimental-atm-queries" && !pack.path
+    );
   switch (mlPoweredJsQueryPacks.length) {
     case 1:
       // We should always specify an explicit version string in `getMlPoweredJsQueriesPack`,
@@ -707,4 +626,262 @@ export function getMlPoweredJsQueriesStatus(config: Config): string {
     default:
       return "other";
   }
+}
+
+/**
+ * Prompt the customer to upgrade to CodeQL Action v2, if appropriate.
+ *
+ * Check whether a customer is running v1. If they are, and we can determine that the GitHub
+ * instance supports v2, then log an error that v1 is deprecated and prompt the customer to
+ * upgrade to v2.
+ */
+export async function checkActionVersion(version: string) {
+  if (!semver.satisfies(version, ">=2")) {
+    core.error(
+      "This version of the CodeQL Action was deprecated on January 18th, 2023, and is no longer " +
+        "updated or supported. For better performance, improved security, and new features, " +
+        "upgrade to v2. For more information, see " +
+        "https://github.blog/changelog/2023-01-18-code-scanning-codeql-action-v1-is-now-deprecated/"
+    );
+  }
+}
+
+/*
+ * Returns whether we are in test mode.
+ *
+ * In test mode, we don't upload SARIF results or status reports to the GitHub API.
+ */
+export function isInTestMode(): boolean {
+  return process.env[CODEQL_ACTION_TEST_MODE] === "true";
+}
+
+/**
+ * @returns true if the action should generate a conde-scanning config file
+ * that gets passed to the CLI.
+ */
+export async function useCodeScanningConfigInCli(
+  codeql: CodeQL,
+  featureEnablement: FeatureEnablement
+): Promise<boolean> {
+  return await featureEnablement.getValue(Feature.CliConfigFileEnabled, codeql);
+}
+
+export async function logCodeScanningConfigInCli(
+  codeql: CodeQL,
+  featureEnablement: FeatureEnablement,
+  logger: Logger
+) {
+  if (await useCodeScanningConfigInCli(codeql, featureEnablement)) {
+    logger.info(
+      "Code Scanning configuration file being processed in the codeql CLI."
+    );
+  } else {
+    logger.info(
+      "Code Scanning configuration file being processed in the codeql-action."
+    );
+  }
+}
+
+/*
+ * Returns whether the path in the argument represents an existing directory.
+ */
+export function doesDirectoryExist(dirPath: string): boolean {
+  try {
+    const stats = fs.lstatSync(dirPath);
+    return stats.isDirectory();
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Returns a recursive list of files in a given directory.
+ */
+export function listFolder(dir: string): string[] {
+  if (!doesDirectoryExist(dir)) {
+    return [];
+  }
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  let files: string[] = [];
+  for (const entry of entries) {
+    if (entry.isFile()) {
+      files.push(path.resolve(dir, entry.name));
+    } else if (entry.isDirectory()) {
+      files = files.concat(listFolder(path.resolve(dir, entry.name)));
+    }
+  }
+  return files;
+}
+
+/**
+ * Get the size a folder in bytes. This will log any filesystem errors
+ * as a warning and then return undefined.
+ *
+ * @param cacheDir A directory to get the size of.
+ * @param logger A logger to log any errors to.
+ * @returns The size in bytes of the folder, or undefined if errors occurred.
+ */
+export async function tryGetFolderBytes(
+  cacheDir: string,
+  logger: Logger
+): Promise<number | undefined> {
+  try {
+    return await promisify<string, number>(getFolderSize)(cacheDir);
+  } catch (e) {
+    logger.warning(`Encountered an error while getting size of folder: ${e}`);
+    return undefined;
+  }
+}
+
+let hadTimeout = false;
+
+/**
+ * Run a promise for a given amount of time, and if it doesn't resolve within
+ * that time, call the provided callback and then return undefined. Due to the
+ * limitation outlined below, using this helper function is not recommended
+ * unless there is no other option for adding a timeout (e.g. the code that
+ * would need the timeout added is an external library).
+ *
+ * Important: This does NOT cancel the original promise, so that promise will
+ * continue in the background even after the timeout has expired. If the
+ * original promise hangs, then this will prevent the process terminating.
+ * If a timeout has occurred then the global hadTimeout variable will get set
+ * to true, and the caller is responsible for forcing the process to exit
+ * if this is the case by calling the `checkForTimeout` function at the end
+ * of execution.
+ *
+ * @param timeoutMs The timeout in milliseconds.
+ * @param promise The promise to run.
+ * @param onTimeout A callback to call if the promise times out.
+ * @returns The result of the promise, or undefined if the promise times out.
+ */
+export async function withTimeout<T>(
+  timeoutMs: number,
+  promise: Promise<T>,
+  onTimeout: () => void
+): Promise<T | undefined> {
+  let finished = false;
+  const mainTask = async () => {
+    const result = await promise;
+    finished = true;
+    return result;
+  };
+  const timeout: Promise<undefined> = new Promise((resolve) => {
+    setTimeout(() => {
+      if (!finished) {
+        // Workaround: While the promise racing below will allow the main code
+        // to continue, the process won't normally exit until the asynchronous
+        // task in the background has finished. We set this variable to force
+        // an exit at the end of our code when `checkForTimeout` is called.
+        hadTimeout = true;
+        onTimeout();
+      }
+      resolve(undefined);
+    }, timeoutMs);
+  });
+
+  return await Promise.race([mainTask(), timeout]);
+}
+
+/**
+ * Check if the global hadTimeout variable has been set, and if so then
+ * exit the process to ensure any background tasks that are still running
+ * are killed. This should be called at the end of execution if the
+ * `withTimeout` function has been used.
+ */
+export async function checkForTimeout() {
+  if (hadTimeout === true) {
+    core.info(
+      "A timeout occurred, force exiting the process after 30 seconds to prevent hanging."
+    );
+    await delay(30_000);
+    process.exit();
+  }
+}
+
+/**
+ * This function implements a heuristic to determine whether the
+ * runner we are on is hosted by GitHub. It does this by checking
+ * the name of the runner against the list of known GitHub-hosted
+ * runner names. It also checks for the presence of a toolcache
+ * directory with the name hostedtoolcache which is present on
+ * GitHub-hosted runners.
+ *
+ * @returns true iff the runner is hosted by GitHub
+ */
+export function isHostedRunner() {
+  return (
+    // Name of the runner on hosted Windows runners
+    process.env["RUNNER_NAME"]?.includes("Hosted Agent") ||
+    // Name of the runner on hosted POSIX runners
+    process.env["RUNNER_NAME"]?.includes("GitHub Actions") ||
+    // Segment of the path to the tool cache on all hosted runners
+    process.env["RUNNER_TOOL_CACHE"]?.includes("hostedtoolcache")
+  );
+}
+
+/**
+ *
+ * @param featuresEnablement The features enabled for the current run
+ * @param languagesInput Languages input from the workflow
+ * @param repository The owner/name of the repository
+ * @param logger A logger
+ * @returns A boolean indicating whether or not the toolcache should be bypassed and the latest codeql should be downloaded.
+ */
+export async function shouldBypassToolcache(
+  featuresEnablement: FeatureEnablement,
+  codeqlUrl: string | undefined,
+  languagesInput: string | undefined,
+  repository: RepositoryNwo,
+  logger: Logger
+): Promise<boolean> {
+  // An explicit codeql url is specified, that means the toolcache will not be used.
+  if (codeqlUrl) {
+    return true;
+  }
+
+  // Check if the toolcache is disabled for all languages
+  if (await featuresEnablement.getValue(Feature.BypassToolcacheEnabled)) {
+    return true;
+  }
+
+  // Check if the toolcache is disabled for kotlin and swift.
+  if (
+    !(await featuresEnablement.getValue(
+      Feature.BypassToolcacheKotlinSwiftEnabled
+    ))
+  ) {
+    return false;
+  }
+
+  // Now check to see if kotlin or swift is one of the languages being analyzed.
+  const { rawLanguages, autodetected } = await getRawLanguages(
+    languagesInput,
+    repository,
+    logger
+  );
+  let bypass = rawLanguages.some((lang) => KOTLIN_SWIFT_BYPASS.includes(lang));
+  if (bypass) {
+    logger.info(
+      `Bypassing toolcache for kotlin or swift. Languages: ${rawLanguages}`
+    );
+  } else if (!autodetected && rawLanguages.includes(Language.java)) {
+    // special case: java was explicitly specified, but there might be
+    // some kotlin in the repository, so we need to make a request for that.
+    const langsInRepo = await getLanguagesInRepo(repository, logger);
+    if (langsInRepo.includes("kotlin")) {
+      logger.info(`Bypassing toolcache for kotlin.`);
+      bypass = true;
+    }
+  }
+  return bypass;
+}
+
+export function parseMatrixInput(
+  matrixInput: string | undefined
+): { [key: string]: string } | undefined {
+  if (matrixInput === undefined || matrixInput === "null") {
+    return undefined;
+  }
+  return JSON.parse(matrixInput);
 }

@@ -59,15 +59,15 @@ jobs:
         uses: github/codeql-action/init@v2
         # Override language selection by uncommenting this and choosing your languages
         # with:
-        #   languages: go, javascript, csharp, python, cpp, java
+        #   languages: go, javascript, csharp, python, cpp, java, ruby
 
-      # Autobuild attempts to build any compiled languages (C/C++, C#, or Java).
+      # Autobuild attempts to build any compiled languages (C/C++, C#, Go, or Java).
       # If this step fails, then you should remove it and run the build manually (see below).
       - name: Autobuild
         uses: github/codeql-action/autobuild@v2
 
       # ℹ️ Command-line programs to run using the OS shell.
-      # 📚 https://git.io/JvXDl
+      # 📚 See https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsrun
 
       # ✏️ If the Autobuild fails above, remove it and uncomment the following
       #    three lines and modify them (or add more) to build your code if your
@@ -139,10 +139,3 @@ By default, this will override any queries specified in a config file. If you wi
 
 Read about [troubleshooting code scanning](https://help.github.com/en/github/finding-security-vulnerabilities-and-errors-in-your-code/troubleshooting-code-scanning).
 
-### Note on "missing analysis" message
-
-The very first time code scanning is run and if it is on a pull request, you will probably get a message mentioning a "missing analysis". This is expected.
-
-After code scanning has analyzed the code in a pull request, it needs to compare the analysis of the topic branch (the merge commit of the branch you used to create the pull request) with the analysis of the base branch (the branch into which you want to merge the pull request). This allows code scanning to compute which alerts are newly introduced by the pull request, which alerts were already present in the base branch, and whether any existing alerts are fixed by the changes in the pull request. Initially, if you use a pull request to add code scanning to a repository, the base branch has not yet been analyzed, so it's not possible to compute these details. In this case, when you click through from the results check on the pull request you will see the "Missing analysis for base commit SHA-HASH" message.
-
-For more information and other causes of this message, see [Reasons for the "Analysis not found" message](https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/setting-up-code-scanning-for-a-repository#reasons-for-the-analysis-not-found-message)

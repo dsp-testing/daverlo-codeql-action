@@ -7,12 +7,12 @@ name: 'PR Check - Packaging: Config file'
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GO111MODULE: auto
+  CODEQL_EXTRACTOR_JAVA_AGENT_DISABLE_KOTLIN: 'true'
 on:
   push:
     branches:
     - main
-    - v1
-    - v2
+    - releases/v2
   pull_request:
     types:
     - opened
@@ -26,9 +26,23 @@ jobs:
       matrix:
         include:
         - os: ubuntu-latest
-          version: nightly-20210831
+          version: latest
         - os: macos-latest
-          version: nightly-20210831
+          version: latest
+        - os: windows-latest
+          version: latest
+        - os: ubuntu-latest
+          version: cached
+        - os: macos-latest
+          version: cached
+        - os: windows-latest
+          version: cached
+        - os: ubuntu-latest
+          version: nightly-latest
+        - os: macos-latest
+          version: nightly-latest
+        - os: windows-latest
+          version: nightly-latest
     name: 'Packaging: Config file'
     timeout-minutes: 45
     runs-on: ${{ matrix.os }}
@@ -51,21 +65,27 @@ jobs:
     - uses: ./../action/analyze
       with:
         output: ${{ runner.temp }}/results
-      env:
-        TEST_MODE: true
+
+    - name: Check results
+      uses: ./../action/.github/check-sarif
+      with:
+        sarif-file: ${{ runner.temp }}/results/javascript.sarif
+        queries-run: javascript/example/empty-or-one-block,javascript/example/empty-or-one-block,javascript/example/other-query-block,javascript/example/two-block
+        queries-not-run: foo,bar
+
     - name: Assert Results
       shell: bash
       run: |
         cd "$RUNNER_TEMP/results"
-        # We should have 3 hits from these rules
-        EXPECTED_RULES="javascript/example/empty-or-one-block javascript/example/empty-or-one-block javascript/example/two-block"
+        # We should have 4 hits from these rules
+        EXPECTED_RULES="javascript/example/empty-or-one-block javascript/example/empty-or-one-block javascript/example/other-query-block javascript/example/two-block"
 
         # use tr to replace newlines with spaces and xargs to trim leading and trailing whitespace
-        RULES="$(cat javascript.sarif | jq -r '.runs[0].results[].ruleId' | sort | tr "\n" " " | xargs)"
+        RULES="$(cat javascript.sarif | jq -r '.runs[0].results[].ruleId' | sort | tr "\n\r" " " | xargs)"
         echo "Found matching rules '$RULES'"
         if [ "$RULES" != "$EXPECTED_RULES" ]; then
           echo "Did not match expected rules '$EXPECTED_RULES'."
           exit 1
         fi
     env:
-      INTERNAL_CODEQL_ACTION_DEBUG_LOC: true
+      CODEQL_ACTION_TEST_MODE: true

@@ -8,11 +8,17 @@ import {
   sendStatusReport,
   StatusReportBase,
 } from "./actions-util";
-import { determineAutobuildLanguage, runAutobuild } from "./autobuild";
-import * as config_utils from "./config-utils";
+import { getGitHubVersion } from "./api-client";
+import { determineAutobuildLanguages, runAutobuild } from "./autobuild";
+import * as configUtils from "./config-utils";
 import { Language } from "./languages";
 import { getActionsLogger } from "./logging";
-import { initializeEnvironment, Mode } from "./util";
+import {
+  DID_AUTOBUILD_GO_ENV_VAR_NAME,
+  checkActionVersion,
+  checkGitHubVersionInRange,
+  initializeEnvironment,
+} from "./util";
 
 // eslint-disable-next-line import/no-commonjs
 const pkg = require("../package.json");
@@ -30,7 +36,7 @@ async function sendCompletedStatusReport(
   failingLanguage?: string,
   cause?: Error
 ) {
-  initializeEnvironment(Mode.actions, pkg.version);
+  initializeEnvironment(pkg.version);
 
   const status = getActionsStatus(cause, failingLanguage);
   const statusReportBase = await createStatusReportBase(
@@ -49,9 +55,11 @@ async function sendCompletedStatusReport(
 }
 
 async function run() {
-  const logger = getActionsLogger();
   const startedAt = new Date();
-  let language: Language | undefined = undefined;
+  const logger = getActionsLogger();
+  await checkActionVersion(pkg.version);
+  let currentLanguage: Language | undefined = undefined;
+  let languages: Language[] | undefined = undefined;
   try {
     if (
       !(await sendStatusReport(
@@ -61,17 +69,18 @@ async function run() {
       return;
     }
 
-    const config = await config_utils.getConfig(
-      getTemporaryDirectory(),
-      logger
-    );
+    const gitHubVersion = await getGitHubVersion();
+    checkGitHubVersionInRange(gitHubVersion, logger);
+
+    const config = await configUtils.getConfig(getTemporaryDirectory(), logger);
     if (config === undefined) {
       throw new Error(
         "Config file could not be found at expected location. Has the 'init' action been called?"
       );
     }
-    language = determineAutobuildLanguage(config, logger);
-    if (language !== undefined) {
+
+    languages = await determineAutobuildLanguages(config, logger);
+    if (languages !== undefined) {
       const workingDirectory = getOptionalInput("working-directory");
       if (workingDirectory) {
         logger.info(
@@ -79,7 +88,13 @@ async function run() {
         );
         process.chdir(workingDirectory);
       }
-      await runAutobuild(language, config, logger);
+      for (const language of languages) {
+        currentLanguage = language;
+        await runAutobuild(language, config, logger);
+        if (language === Language.go) {
+          core.exportVariable(DID_AUTOBUILD_GO_ENV_VAR_NAME, "true");
+        }
+      }
     }
   } catch (error) {
     core.setFailed(
@@ -90,14 +105,14 @@ async function run() {
     console.log(error);
     await sendCompletedStatusReport(
       startedAt,
-      language ? [language] : [],
-      language,
+      languages ?? [],
+      currentLanguage,
       error instanceof Error ? error : new Error(String(error))
     );
     return;
   }
 
-  await sendCompletedStatusReport(startedAt, language ? [language] : []);
+  await sendCompletedStatusReport(startedAt, languages ?? []);
 }
 
 async function runWrapper() {

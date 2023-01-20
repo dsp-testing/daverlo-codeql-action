@@ -3,16 +3,21 @@ import * as path from "path";
 
 import * as github from "@actions/github";
 import test, { ExecutionContext } from "ava";
-import { clean } from "semver";
+import * as yaml from "js-yaml";
 import * as sinon from "sinon";
 
 import * as api from "./api-client";
-import { getCachedCodeQL, setCodeQL } from "./codeql";
+import { getCachedCodeQL, PackDownloadOutput, setCodeQL } from "./codeql";
 import * as configUtils from "./config-utils";
-import { createFeatureFlags, FeatureFlag } from "./feature-flags";
+import { Feature } from "./feature-flags";
 import { Language } from "./languages";
-import { getRunnerLogger } from "./logging";
-import { setupTests } from "./testing-utils";
+import { getRunnerLogger, Logger } from "./logging";
+import { parseRepositoryNwo } from "./repository";
+import {
+  setupTests,
+  createFeatures,
+  mockLanguagesInRepo as mockLanguagesInRepo,
+} from "./testing-utils";
 import * as util from "./util";
 
 setupTests(test);
@@ -21,6 +26,8 @@ const sampleApiDetails = {
   auth: "token",
   externalRepoAuth: "token",
   url: "https://github.example.com",
+  apiURL: undefined,
+  registriesAuthTokens: undefined,
 };
 
 const gitHubVersion = { type: util.GitHubVariant.DOTCOM } as util.GitHubVersion;
@@ -46,6 +53,7 @@ function mockGetContents(
     .stub(client.repos, "getContent")
     .resolves(response as any);
   sinon.stub(api, "getApiClient").value(() => client);
+  sinon.stub(api, "getApiClientWithExternalAuth").value(() => client);
   return spyGetContents;
 }
 
@@ -78,6 +86,9 @@ test("load empty config", async (t) => {
           multipleDeclaredLanguages: {},
         };
       },
+      async packDownload(): Promise<PackDownloadOutput> {
+        return { packs: [] };
+      },
     });
 
     const config = await configUtils.initConfig(
@@ -86,17 +97,18 @@ test("load empty config", async (t) => {
       undefined,
       undefined,
       undefined,
+      undefined,
+      false,
       false,
       "",
       "",
       { owner: "github", repo: "example " },
       tmpDir,
-      tmpDir,
       codeQL,
       tmpDir,
       gitHubVersion,
       sampleApiDetails,
-      createFeatureFlags([]),
+      createFeatures([]),
       logger
     );
 
@@ -108,16 +120,16 @@ test("load empty config", async (t) => {
         undefined,
         undefined,
         false,
+        false,
         "",
         "",
         { owner: "github", repo: "example " },
-        tmpDir,
         tmpDir,
         codeQL,
         tmpDir,
         gitHubVersion,
         sampleApiDetails,
-        createFeatureFlags([]),
+        createFeatures([]),
         logger
       )
     );
@@ -139,6 +151,9 @@ test("loading config saves config", async (t) => {
           multipleDeclaredLanguages: {},
         };
       },
+      async packDownload(): Promise<PackDownloadOutput> {
+        return { packs: [] };
+      },
     });
 
     // Sanity check the saved config file does not already exist
@@ -153,17 +168,18 @@ test("loading config saves config", async (t) => {
       undefined,
       undefined,
       undefined,
+      undefined,
+      false,
       false,
       "",
       "",
       { owner: "github", repo: "example " },
       tmpDir,
-      tmpDir,
       codeQL,
       tmpDir,
       gitHubVersion,
       sampleApiDetails,
-      createFeatureFlags([]),
+      createFeatures([]),
       logger
     );
 
@@ -174,7 +190,9 @@ test("loading config saves config", async (t) => {
     const config2 = await configUtils.getConfig(tmpDir, logger);
     t.not(config2, undefined);
     if (config2 !== undefined) {
-      t.deepEqual(config1, config2);
+      // removes properties assigned to undefined.
+      const expectedConfig = JSON.parse(JSON.stringify(config1));
+      t.deepEqual(expectedConfig, config2);
     }
   });
 });
@@ -186,19 +204,20 @@ test("load input outside of workspace", async (t) => {
         undefined,
         undefined,
         undefined,
+        undefined,
         "../input",
         undefined,
+        false,
         false,
         "",
         "",
         { owner: "github", repo: "example " },
         tmpDir,
-        tmpDir,
         getCachedCodeQL(),
         tmpDir,
         gitHubVersion,
         sampleApiDetails,
-        createFeatureFlags([]),
+        createFeatures([]),
         getRunnerLogger(true)
       );
       throw new Error("initConfig did not throw error");
@@ -225,19 +244,20 @@ test("load non-local input with invalid repo syntax", async (t) => {
         undefined,
         undefined,
         undefined,
+        undefined,
         configFile,
         undefined,
+        false,
         false,
         "",
         "",
         { owner: "github", repo: "example " },
         tmpDir,
-        tmpDir,
         getCachedCodeQL(),
         tmpDir,
         gitHubVersion,
         sampleApiDetails,
-        createFeatureFlags([]),
+        createFeatures([]),
         getRunnerLogger(true)
       );
       throw new Error("initConfig did not throw error");
@@ -265,19 +285,20 @@ test("load non-existent input", async (t) => {
         languages,
         undefined,
         undefined,
+        undefined,
         configFile,
         undefined,
+        false,
         false,
         "",
         "",
         { owner: "github", repo: "example " },
         tmpDir,
-        tmpDir,
         getCachedCodeQL(),
         tmpDir,
         gitHubVersion,
         sampleApiDetails,
-        createFeatureFlags([]),
+        createFeatures([]),
         getRunnerLogger(true)
       );
       throw new Error("initConfig did not throw error");
@@ -308,6 +329,9 @@ test("load non-empty input", async (t) => {
           noDeclaredLanguage: {},
           multipleDeclaredLanguages: {},
         };
+      },
+      async packDownload(): Promise<PackDownloadOutput> {
+        return { packs: [] };
       },
     });
 
@@ -349,7 +373,6 @@ test("load non-empty input", async (t) => {
         paths: ["c/d"],
       },
       tempDir: tmpDir,
-      toolCacheDir: tmpDir,
       codeQLCmd: codeQL.getPath(),
       gitHubVersion,
       dbLocation: path.resolve(tmpDir, "codeql_databases"),
@@ -357,7 +380,9 @@ test("load non-empty input", async (t) => {
       debugMode: false,
       debugArtifactName: "my-artifact",
       debugDatabaseName: "my-db",
-      injectedMlQueries: false,
+      augmentationProperties: configUtils.defaultAugmentationProperties,
+      trapCaches: {},
+      trapCacheDownloadTime: 0,
     };
 
     const languages = "javascript";
@@ -367,19 +392,20 @@ test("load non-empty input", async (t) => {
       languages,
       undefined,
       undefined,
+      undefined,
       configFilePath,
       undefined,
+      false,
       false,
       "my-artifact",
       "my-db",
       { owner: "github", repo: "example " },
       tmpDir,
-      tmpDir,
       codeQL,
       tmpDir,
       gitHubVersion,
       sampleApiDetails,
-      createFeatureFlags([]),
+      createFeatures([]),
       getRunnerLogger(true)
     );
 
@@ -416,6 +442,9 @@ test("Default queries are used", async (t) => {
           multipleDeclaredLanguages: {},
         };
       },
+      async packDownload(): Promise<PackDownloadOutput> {
+        return { packs: [] };
+      },
     });
 
     // The important point of this config is that it doesn't specify
@@ -434,19 +463,20 @@ test("Default queries are used", async (t) => {
       languages,
       undefined,
       undefined,
+      undefined,
       configFilePath,
       undefined,
+      false,
       false,
       "",
       "",
       { owner: "github", repo: "example " },
       tmpDir,
-      tmpDir,
       codeQL,
       tmpDir,
       gitHubVersion,
       sampleApiDetails,
-      createFeatureFlags([]),
+      createFeatures([]),
       getRunnerLogger(true)
     );
 
@@ -501,6 +531,9 @@ test("Queries can be specified in config file", async (t) => {
         resolveQueriesArgs.push({ queries, extraSearchPath });
         return queriesToResolvedQueryForm(queries);
       },
+      async packDownload(): Promise<PackDownloadOutput> {
+        return { packs: [] };
+      },
     });
 
     const languages = "javascript";
@@ -509,19 +542,20 @@ test("Queries can be specified in config file", async (t) => {
       languages,
       undefined,
       undefined,
+      undefined,
       configFilePath,
       undefined,
+      false,
       false,
       "",
       "",
       { owner: "github", repo: "example " },
       tmpDir,
-      tmpDir,
       codeQL,
       tmpDir,
       gitHubVersion,
       sampleApiDetails,
-      createFeatureFlags([]),
+      createFeatures([]),
       getRunnerLogger(true)
     );
 
@@ -530,16 +564,21 @@ test("Queries can be specified in config file", async (t) => {
     // and once for `./foo` from the config file.
     t.deepEqual(resolveQueriesArgs.length, 2);
     t.deepEqual(resolveQueriesArgs[1].queries.length, 1);
-    t.regex(resolveQueriesArgs[1].queries[0], /.*\/foo$/);
+    t.true(resolveQueriesArgs[1].queries[0].endsWith(`${path.sep}foo`));
 
     // Now check that the end result contains the default queries and the query from config
     t.deepEqual(config.queries["javascript"].builtin.length, 1);
     t.deepEqual(config.queries["javascript"].custom.length, 1);
-    t.regex(
-      config.queries["javascript"].builtin[0],
-      /javascript-code-scanning.qls$/
+    t.true(
+      config.queries["javascript"].builtin[0].endsWith(
+        "javascript-code-scanning.qls"
+      )
     );
-    t.regex(config.queries["javascript"].custom[0].queries[0], /.*\/foo$/);
+    t.true(
+      config.queries["javascript"].custom[0].queries[0].endsWith(
+        `${path.sep}foo`
+      )
+    );
   });
 });
 
@@ -570,6 +609,9 @@ test("Queries from config file can be overridden in workflow file", async (t) =>
         resolveQueriesArgs.push({ queries, extraSearchPath });
         return queriesToResolvedQueryForm(queries);
       },
+      async packDownload(): Promise<PackDownloadOutput> {
+        return { packs: [] };
+      },
     });
 
     const languages = "javascript";
@@ -578,19 +620,20 @@ test("Queries from config file can be overridden in workflow file", async (t) =>
       languages,
       testQueries,
       undefined,
+      undefined,
       configFilePath,
       undefined,
+      false,
       false,
       "",
       "",
       { owner: "github", repo: "example " },
       tmpDir,
-      tmpDir,
       codeQL,
       tmpDir,
       gitHubVersion,
       sampleApiDetails,
-      createFeatureFlags([]),
+      createFeatures([]),
       getRunnerLogger(true)
     );
 
@@ -599,16 +642,21 @@ test("Queries from config file can be overridden in workflow file", async (t) =>
     // but won't be called for './foo' from the config file.
     t.deepEqual(resolveQueriesArgs.length, 2);
     t.deepEqual(resolveQueriesArgs[1].queries.length, 1);
-    t.regex(resolveQueriesArgs[1].queries[0], /.*\/override$/);
+    t.true(resolveQueriesArgs[1].queries[0].endsWith(`${path.sep}override`));
 
     // Now check that the end result contains only the default queries and the override query
     t.deepEqual(config.queries["javascript"].builtin.length, 1);
     t.deepEqual(config.queries["javascript"].custom.length, 1);
-    t.regex(
-      config.queries["javascript"].builtin[0],
-      /javascript-code-scanning.qls$/
+    t.true(
+      config.queries["javascript"].builtin[0].endsWith(
+        "javascript-code-scanning.qls"
+      )
     );
-    t.regex(config.queries["javascript"].custom[0].queries[0], /.*\/override$/);
+    t.true(
+      config.queries["javascript"].custom[0].queries[0].endsWith(
+        `${path.sep}override`
+      )
+    );
   });
 });
 
@@ -637,6 +685,9 @@ test("Queries in workflow file can be used in tandem with the 'disable default q
         resolveQueriesArgs.push({ queries, extraSearchPath });
         return queriesToResolvedQueryForm(queries);
       },
+      async packDownload(): Promise<PackDownloadOutput> {
+        return { packs: [] };
+      },
     });
 
     const languages = "javascript";
@@ -645,19 +696,20 @@ test("Queries in workflow file can be used in tandem with the 'disable default q
       languages,
       testQueries,
       undefined,
+      undefined,
       configFilePath,
       undefined,
+      false,
       false,
       "",
       "",
       { owner: "github", repo: "example " },
       tmpDir,
-      tmpDir,
       codeQL,
       tmpDir,
       gitHubVersion,
       sampleApiDetails,
-      createFeatureFlags([]),
+      createFeatures([]),
       getRunnerLogger(true)
     );
 
@@ -666,14 +718,17 @@ test("Queries in workflow file can be used in tandem with the 'disable default q
     // but won't be called for the default one since that was disabled
     t.deepEqual(resolveQueriesArgs.length, 1);
     t.deepEqual(resolveQueriesArgs[0].queries.length, 1);
-    t.regex(resolveQueriesArgs[0].queries[0], /.*\/workflow-query$/);
+    t.true(
+      resolveQueriesArgs[0].queries[0].endsWith(`${path.sep}workflow-query`)
+    );
 
     // Now check that the end result contains only the workflow query, and not the default one
     t.deepEqual(config.queries["javascript"].builtin.length, 0);
     t.deepEqual(config.queries["javascript"].custom.length, 1);
-    t.regex(
-      config.queries["javascript"].custom[0].queries[0],
-      /.*\/workflow-query$/
+    t.true(
+      config.queries["javascript"].custom[0].queries[0].endsWith(
+        `${path.sep}workflow-query`
+      )
     );
   });
 });
@@ -697,6 +752,9 @@ test("Multiple queries can be specified in workflow file, no config file require
         resolveQueriesArgs.push({ queries, extraSearchPath });
         return queriesToResolvedQueryForm(queries);
       },
+      async packDownload(): Promise<PackDownloadOutput> {
+        return { packs: [] };
+      },
     });
 
     const languages = "javascript";
@@ -707,17 +765,18 @@ test("Multiple queries can be specified in workflow file, no config file require
       undefined,
       undefined,
       undefined,
+      undefined,
+      false,
       false,
       "",
       "",
       { owner: "github", repo: "example " },
       tmpDir,
-      tmpDir,
       codeQL,
       tmpDir,
       gitHubVersion,
       sampleApiDetails,
-      createFeatureFlags([]),
+      createFeatures([]),
       getRunnerLogger(true)
     );
 
@@ -727,23 +786,26 @@ test("Multiple queries can be specified in workflow file, no config file require
     t.deepEqual(resolveQueriesArgs.length, 3);
     t.deepEqual(resolveQueriesArgs[1].queries.length, 1);
     t.deepEqual(resolveQueriesArgs[2].queries.length, 1);
-    t.regex(resolveQueriesArgs[1].queries[0], /.*\/override1$/);
-    t.regex(resolveQueriesArgs[2].queries[0], /.*\/override2$/);
+    t.true(resolveQueriesArgs[1].queries[0].endsWith(`${path.sep}override1`));
+    t.true(resolveQueriesArgs[2].queries[0].endsWith(`${path.sep}override2`));
 
     // Now check that the end result contains both the queries from the workflow, as well as the defaults
     t.deepEqual(config.queries["javascript"].builtin.length, 1);
     t.deepEqual(config.queries["javascript"].custom.length, 2);
-    t.regex(
-      config.queries["javascript"].builtin[0],
-      /javascript-code-scanning.qls$/
+    t.true(
+      config.queries["javascript"].builtin[0].endsWith(
+        "javascript-code-scanning.qls"
+      )
     );
-    t.regex(
-      config.queries["javascript"].custom[0].queries[0],
-      /.*\/override1$/
+    t.true(
+      config.queries["javascript"].custom[0].queries[0].endsWith(
+        `${path.sep}override1`
+      )
     );
-    t.regex(
-      config.queries["javascript"].custom[1].queries[0],
-      /.*\/override2$/
+    t.true(
+      config.queries["javascript"].custom[1].queries[0].endsWith(
+        `${path.sep}override2`
+      )
     );
   });
 });
@@ -778,6 +840,9 @@ test("Queries in workflow file can be added to the set of queries without overri
         resolveQueriesArgs.push({ queries, extraSearchPath });
         return queriesToResolvedQueryForm(queries);
       },
+      async packDownload(): Promise<PackDownloadOutput> {
+        return { packs: [] };
+      },
     });
 
     const languages = "javascript";
@@ -786,19 +851,20 @@ test("Queries in workflow file can be added to the set of queries without overri
       languages,
       testQueries,
       undefined,
+      undefined,
       configFilePath,
       undefined,
+      false,
       false,
       "",
       "",
       { owner: "github", repo: "example " },
       tmpDir,
-      tmpDir,
       codeQL,
       tmpDir,
       gitHubVersion,
       sampleApiDetails,
-      createFeatureFlags([]),
+      createFeatures([]),
       getRunnerLogger(true)
     );
 
@@ -808,28 +874,35 @@ test("Queries in workflow file can be added to the set of queries without overri
     // and once for './foo' from the config file
     t.deepEqual(resolveQueriesArgs.length, 4);
     t.deepEqual(resolveQueriesArgs[1].queries.length, 1);
-    t.regex(resolveQueriesArgs[1].queries[0], /.*\/additional1$/);
+    t.true(resolveQueriesArgs[1].queries[0].endsWith(`${path.sep}additional1`));
     t.deepEqual(resolveQueriesArgs[2].queries.length, 1);
-    t.regex(resolveQueriesArgs[2].queries[0], /.*\/additional2$/);
+    t.true(resolveQueriesArgs[2].queries[0].endsWith(`${path.sep}additional2`));
     t.deepEqual(resolveQueriesArgs[3].queries.length, 1);
-    t.regex(resolveQueriesArgs[3].queries[0], /.*\/foo$/);
+    t.true(resolveQueriesArgs[3].queries[0].endsWith(`${path.sep}foo`));
 
     // Now check that the end result contains all the queries
     t.deepEqual(config.queries["javascript"].builtin.length, 1);
     t.deepEqual(config.queries["javascript"].custom.length, 3);
-    t.regex(
-      config.queries["javascript"].builtin[0],
-      /javascript-code-scanning.qls$/
+    t.true(
+      config.queries["javascript"].builtin[0].endsWith(
+        "javascript-code-scanning.qls"
+      )
     );
-    t.regex(
-      config.queries["javascript"].custom[0].queries[0],
-      /.*\/additional1$/
+    t.true(
+      config.queries["javascript"].custom[0].queries[0].endsWith(
+        `${path.sep}additional1`
+      )
     );
-    t.regex(
-      config.queries["javascript"].custom[1].queries[0],
-      /.*\/additional2$/
+    t.true(
+      config.queries["javascript"].custom[1].queries[0].endsWith(
+        `${path.sep}additional2`
+      )
     );
-    t.regex(config.queries["javascript"].custom[2].queries[0], /.*\/foo$/);
+    t.true(
+      config.queries["javascript"].custom[2].queries[0].endsWith(
+        `${path.sep}foo`
+      )
+    );
   });
 });
 
@@ -850,6 +923,9 @@ test("Invalid queries in workflow file handled correctly", async (t) => {
           multipleDeclaredLanguages: {},
         };
       },
+      async packDownload(): Promise<PackDownloadOutput> {
+        return { packs: [] };
+      },
     });
 
     try {
@@ -859,17 +935,18 @@ test("Invalid queries in workflow file handled correctly", async (t) => {
         undefined,
         undefined,
         undefined,
+        undefined,
+        false,
         false,
         "",
         "",
         { owner: "github", repo: "example " },
         tmpDir,
-        tmpDir,
         codeQL,
         tmpDir,
         gitHubVersion,
         sampleApiDetails,
-        createFeatureFlags([]),
+        createFeatures([]),
         getRunnerLogger(true)
       );
       t.fail("initConfig did not throw error");
@@ -895,6 +972,9 @@ test("API client used when reading remote config", async (t) => {
           noDeclaredLanguage: {},
           multipleDeclaredLanguages: {},
         };
+      },
+      async packDownload(): Promise<PackDownloadOutput> {
+        return { packs: [] };
       },
     });
 
@@ -925,19 +1005,20 @@ test("API client used when reading remote config", async (t) => {
       languages,
       undefined,
       undefined,
+      undefined,
       configFile,
       undefined,
+      false,
       false,
       "",
       "",
       { owner: "github", repo: "example " },
       tmpDir,
-      tmpDir,
       codeQL,
       tmpDir,
       gitHubVersion,
       sampleApiDetails,
-      createFeatureFlags([]),
+      createFeatures([]),
       getRunnerLogger(true)
     );
     t.assert(spyGetContents.called);
@@ -955,19 +1036,20 @@ test("Remote config handles the case where a directory is provided", async (t) =
         undefined,
         undefined,
         undefined,
+        undefined,
         repoReference,
         undefined,
+        false,
         false,
         "",
         "",
         { owner: "github", repo: "example " },
         tmpDir,
-        tmpDir,
         getCachedCodeQL(),
         tmpDir,
         gitHubVersion,
         sampleApiDetails,
-        createFeatureFlags([]),
+        createFeatures([]),
         getRunnerLogger(true)
       );
       throw new Error("initConfig did not throw error");
@@ -993,19 +1075,20 @@ test("Invalid format of remote config handled correctly", async (t) => {
         undefined,
         undefined,
         undefined,
+        undefined,
         repoReference,
         undefined,
+        false,
         false,
         "",
         "",
         { owner: "github", repo: "example " },
         tmpDir,
-        tmpDir,
         getCachedCodeQL(),
         tmpDir,
         gitHubVersion,
         sampleApiDetails,
-        createFeatureFlags([]),
+        createFeatures([]),
         getRunnerLogger(true)
       );
       throw new Error("initConfig did not throw error");
@@ -1025,6 +1108,9 @@ test("No detected languages", async (t) => {
       async resolveLanguages() {
         return {};
       },
+      async packDownload(): Promise<PackDownloadOutput> {
+        return { packs: [] };
+      },
     });
 
     try {
@@ -1034,17 +1120,18 @@ test("No detected languages", async (t) => {
         undefined,
         undefined,
         undefined,
+        undefined,
+        false,
         false,
         "",
         "",
         { owner: "github", repo: "example " },
         tmpDir,
-        tmpDir,
         codeQL,
         tmpDir,
         gitHubVersion,
         sampleApiDetails,
-        createFeatureFlags([]),
+        createFeatures([]),
         getRunnerLogger(true)
       );
       throw new Error("initConfig did not throw error");
@@ -1065,17 +1152,18 @@ test("Unknown languages", async (t) => {
         undefined,
         undefined,
         undefined,
+        undefined,
+        false,
         false,
         "",
         "",
         { owner: "github", repo: "example " },
         tmpDir,
-        tmpDir,
         getCachedCodeQL(),
         tmpDir,
         gitHubVersion,
         sampleApiDetails,
-        createFeatureFlags([]),
+        createFeatures([]),
         getRunnerLogger(true)
       );
       throw new Error("initConfig did not throw error");
@@ -1098,6 +1186,9 @@ test("Config specifies packages", async (t) => {
           multipleDeclaredLanguages: {},
         };
       },
+      async packDownload(): Promise<PackDownloadOutput> {
+        return { packs: [] };
+      },
     });
 
     const inputFileContents = `
@@ -1116,28 +1207,24 @@ test("Config specifies packages", async (t) => {
       languages,
       undefined,
       undefined,
+      undefined,
       configFile,
       undefined,
+      false,
       false,
       "",
       "",
       { owner: "github", repo: "example " },
       tmpDir,
-      tmpDir,
       codeQL,
       tmpDir,
       gitHubVersion,
       sampleApiDetails,
-      createFeatureFlags([]),
+      createFeatures([]),
       getRunnerLogger(true)
     );
     t.deepEqual(packs as unknown, {
-      [Language.javascript]: [
-        {
-          packName: "a/b",
-          version: clean("1.2.3"),
-        },
-      ],
+      [Language.javascript]: ["a/b@1.2.3"],
     });
   });
 });
@@ -1153,6 +1240,9 @@ test("Config specifies packages for multiple languages", async (t) => {
           noDeclaredLanguage: {},
           multipleDeclaredLanguages: {},
         };
+      },
+      async packDownload(): Promise<PackDownloadOutput> {
+        return { packs: [] };
       },
     });
 
@@ -1178,34 +1268,25 @@ test("Config specifies packages for multiple languages", async (t) => {
       languages,
       undefined,
       undefined,
+      undefined,
       configFile,
       undefined,
+      false,
       false,
       "",
       "",
       { owner: "github", repo: "example" },
       tmpDir,
-      tmpDir,
       codeQL,
       tmpDir,
       gitHubVersion,
       sampleApiDetails,
-      createFeatureFlags([]),
+      createFeatures([]),
       getRunnerLogger(true)
     );
     t.deepEqual(packs as unknown, {
-      [Language.javascript]: [
-        {
-          packName: "a/b",
-          version: clean("1.2.3"),
-        },
-      ],
-      [Language.python]: [
-        {
-          packName: "c/d",
-          version: clean("1.2.3"),
-        },
-      ],
+      [Language.javascript]: ["a/b@1.2.3"],
+      [Language.python]: ["c/d@1.2.3"],
     });
     t.deepEqual(queries, {
       cpp: {
@@ -1244,6 +1325,9 @@ function doInvalidInputTest(
             multipleDeclaredLanguages: {},
           };
         },
+        async packDownload(): Promise<PackDownloadOutput> {
+          return { packs: [] };
+        },
       });
 
       const languages = "javascript";
@@ -1256,19 +1340,20 @@ function doInvalidInputTest(
           languages,
           undefined,
           undefined,
+          undefined,
           configFile,
           undefined,
+          false,
           false,
           "",
           "",
           { owner: "github", repo: "example " },
           tmpDir,
-          tmpDir,
           codeQL,
           tmpDir,
           gitHubVersion,
           sampleApiDetails,
-          createFeatureFlags([]),
+          createFeatures([]),
           getRunnerLogger(true)
         );
         throw new Error("initConfig did not throw error");
@@ -1317,7 +1402,7 @@ doInvalidInputTest(
   queries:
   - uses:
       - hello: world`,
-  configUtils.getQueryUsesInvalid
+  configUtils.getQueriesMissingUses
 );
 
 function doInvalidQueryUsesTest(
@@ -1437,10 +1522,15 @@ const parsePacksMacro = test.macro({
     t: ExecutionContext<unknown>,
     packsByLanguage: string[] | Record<string, string[]>,
     languages: Language[],
-    expected: Partial<Record<Language, configUtils.PackWithVersion[]>>
+    expected: Partial<Record<Language, string[]>>
   ) =>
     t.deepEqual(
-      configUtils.parsePacksFromConfig(packsByLanguage, languages, "/a/b"),
+      configUtils.parsePacksFromConfig(
+        packsByLanguage,
+        languages,
+        "/a/b",
+        mockLogger
+      ),
       expected
     ),
 
@@ -1462,7 +1552,8 @@ const parsePacksErrorMacro = test.macro({
         configUtils.parsePacksFromConfig(
           packsByLanguage as string[] | Record<string, string[]>,
           languages,
-          "/a/b"
+          "/a/b",
+          {} as Logger
         ),
       {
         message: expected,
@@ -1490,10 +1581,7 @@ const invalidPackNameMacro = test.macro({
 
 test("no packs", parsePacksMacro, {}, [], {});
 test("two packs", parsePacksMacro, ["a/b", "c/d@1.2.3"], [Language.cpp], {
-  [Language.cpp]: [
-    { packName: "a/b", version: undefined },
-    { packName: "c/d", version: clean("1.2.3") as string },
-  ],
+  [Language.cpp]: ["a/b", "c/d@1.2.3"],
 });
 test(
   "two packs with spaces",
@@ -1501,10 +1589,7 @@ test(
   [" a/b ", " c/d@1.2.3 "],
   [Language.cpp],
   {
-    [Language.cpp]: [
-      { packName: "a/b", version: undefined },
-      { packName: "c/d", version: clean("1.2.3") as string },
-    ],
+    [Language.cpp]: ["a/b", "c/d@1.2.3"],
   }
 );
 test(
@@ -1516,13 +1601,58 @@ test(
   },
   [Language.cpp, Language.java, Language.csharp],
   {
+    [Language.cpp]: ["a/b", "c/d@1.2.3"],
+    [Language.java]: ["d/e", "f/g@1.2.3"],
+  }
+);
+
+test(
+  "two packs with unused language in config",
+  parsePacksMacro,
+  {
+    [Language.cpp]: ["a/b", "c/d@1.2.3"],
+    [Language.java]: ["d/e", "f/g@1.2.3"],
+  },
+  [Language.cpp, Language.csharp],
+  {
+    [Language.cpp]: ["a/b", "c/d@1.2.3"],
+  }
+);
+
+test(
+  "packs with other valid names",
+  parsePacksMacro,
+  [
+    // ranges are ok
+    "c/d@1.0",
+    "c/d@~1.0.0",
+    "c/d@~1.0.0:a/b",
+    "c/d@~1.0.0+abc:a/b",
+    "c/d@~1.0.0-abc:a/b",
+    "c/d:a/b",
+    // whitespace is removed
+    " c/d      @     ~1.0.0    :    b.qls   ",
+    // and it is retained within a path
+    " c/d      @     ~1.0.0    :    b/a path with/spaces.qls   ",
+    // this is valid. the path is '@'. It will probably fail when passed to the CLI
+    "c/d@1.2.3:@",
+    // this is valid, too. It will fail if it doesn't match a path
+    // (globbing is not done)
+    "c/d@1.2.3:+*)_(",
+  ],
+  [Language.cpp],
+  {
     [Language.cpp]: [
-      { packName: "a/b", version: undefined },
-      { packName: "c/d", version: clean("1.2.3") as string },
-    ],
-    [Language.java]: [
-      { packName: "d/e", version: undefined },
-      { packName: "f/g", version: clean("1.2.3") as string },
+      "c/d@1.0",
+      "c/d@~1.0.0",
+      "c/d@~1.0.0:a/b",
+      "c/d@~1.0.0+abc:a/b",
+      "c/d@~1.0.0-abc:a/b",
+      "c/d:a/b",
+      "c/d@~1.0.0:b.qls",
+      "c/d@~1.0.0:b/a path with/spaces.qls",
+      "c/d@1.2.3:@",
+      "c/d@1.2.3:+*)_(",
     ],
   }
 );
@@ -1533,13 +1663,6 @@ test(
   ["a/b@1.2.3"],
   [Language.java, Language.python],
   /The configuration file "\/a\/b" is invalid: property "packs" must split packages by language/
-);
-test(
-  "invalid language",
-  parsePacksErrorMacro,
-  { [Language.java]: ["c/d"] },
-  [Language.cpp],
-  /The configuration file "\/a\/b" is invalid: property "packs" has "java", but it is not one of the languages to analyze/
 );
 test(
   "not an array",
@@ -1553,7 +1676,68 @@ test(invalidPackNameMacro, "c"); // all packs require at least a scope and a nam
 test(invalidPackNameMacro, "c-/d");
 test(invalidPackNameMacro, "-c/d");
 test(invalidPackNameMacro, "c/d_d");
-test(invalidPackNameMacro, "c/d@x");
+test(invalidPackNameMacro, "c/d@@");
+test(invalidPackNameMacro, "c/d@1.0.0:");
+test(invalidPackNameMacro, "c/d:");
+test(invalidPackNameMacro, "c/d:/a");
+test(invalidPackNameMacro, "@1.0.0:a");
+test(invalidPackNameMacro, "c/d@../a");
+test(invalidPackNameMacro, "c/d@b/../a");
+test(invalidPackNameMacro, "c/d:z@1");
+
+/**
+ * Test macro for pretty printing pack specs
+ */
+const packSpecPrettyPrintingMacro = test.macro({
+  exec: (t: ExecutionContext, packStr: string, packObj: configUtils.Pack) => {
+    const parsed = configUtils.parsePacksSpecification(packStr);
+    t.deepEqual(parsed, packObj, "parsed pack spec is correct");
+    const stringified = configUtils.prettyPrintPack(packObj);
+    t.deepEqual(
+      stringified,
+      packStr.trim(),
+      "pretty-printed pack spec is correct"
+    );
+
+    t.deepEqual(
+      configUtils.validatePackSpecification(packStr),
+      packStr.trim(),
+      "pack spec is valid"
+    );
+  },
+  title: (
+    _providedTitle: string | undefined,
+    packStr: string,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    _packObj: configUtils.Pack
+  ) => `Prettyprint pack spec: '${packStr}'`,
+});
+
+test(packSpecPrettyPrintingMacro, "a/b", {
+  name: "a/b",
+  version: undefined,
+  path: undefined,
+});
+test(packSpecPrettyPrintingMacro, "a/b@~1.2.3", {
+  name: "a/b",
+  version: "~1.2.3",
+  path: undefined,
+});
+test(packSpecPrettyPrintingMacro, "a/b@~1.2.3:abc/def", {
+  name: "a/b",
+  version: "~1.2.3",
+  path: "abc/def",
+});
+test(packSpecPrettyPrintingMacro, "a/b:abc/def", {
+  name: "a/b",
+  version: undefined,
+  path: "abc/def",
+});
+test(packSpecPrettyPrintingMacro, "    a/b:abc/def    ", {
+  name: "a/b",
+  version: undefined,
+  path: "abc/def",
+});
 
 /**
  * Test macro for testing the packs block and the packs input
@@ -1566,18 +1750,28 @@ function parseInputAndConfigMacro(
   expected
 ) {
   t.deepEqual(
-    configUtils.parsePacks(packsFromConfig, packsFromInput, languages, "/a/b"),
+    configUtils.parsePacks(
+      packsFromConfig,
+      packsFromInput,
+      !!packsFromInput?.trim().startsWith("+"), // coerce to boolean
+      languages,
+      "/a/b",
+      mockLogger
+    ),
     expected
   );
 }
 parseInputAndConfigMacro.title = (providedTitle: string) =>
   `Parse Packs input and config: ${providedTitle}`;
 
+const mockLogger = getRunnerLogger(true);
+
 function parseInputAndConfigErrorMacro(
   t: ExecutionContext<unknown>,
   packsFromConfig: string[] | Record<string, string[]>,
   packsFromInput: string | undefined,
   languages: Language[],
+  packsFromInputOverride: boolean,
   expected: RegExp
 ) {
   t.throws(
@@ -1585,8 +1779,10 @@ function parseInputAndConfigErrorMacro(
       configUtils.parsePacks(
         packsFromConfig,
         packsFromInput,
+        packsFromInputOverride,
         languages,
-        "/a/b"
+        "/a/b",
+        mockLogger
       );
     },
     {
@@ -1598,7 +1794,7 @@ parseInputAndConfigErrorMacro.title = (providedTitle: string) =>
   `Parse Packs input and config Error: ${providedTitle}`;
 
 test("input only", parseInputAndConfigMacro, {}, " c/d ", [Language.cpp], {
-  [Language.cpp]: [{ packName: "c/d", version: undefined }],
+  [Language.cpp]: ["c/d"],
 });
 
 test(
@@ -1608,10 +1804,7 @@ test(
   "a/b , c/d@1.2.3",
   [Language.cpp],
   {
-    [Language.cpp]: [
-      { packName: "a/b", version: undefined },
-      { packName: "c/d", version: "1.2.3" },
-    ],
+    [Language.cpp]: ["a/b", "c/d@1.2.3"],
   }
 );
 
@@ -1622,10 +1815,7 @@ test(
   "  +  a/b , c/d@1.2.3 ",
   [Language.cpp],
   {
-    [Language.cpp]: [
-      { packName: "a/b", version: undefined },
-      { packName: "c/d", version: "1.2.3" },
-    ],
+    [Language.cpp]: ["a/b", "c/d@1.2.3"],
   }
 );
 
@@ -1636,10 +1826,7 @@ test(
   "  ",
   [Language.cpp],
   {
-    [Language.cpp]: [
-      { packName: "a/b", version: undefined },
-      { packName: "c/d", version: undefined },
-    ],
+    [Language.cpp]: ["a/b", "c/d"],
   }
 );
 
@@ -1650,10 +1837,7 @@ test(
   " e/f, g/h@1.2.3 ",
   [Language.cpp],
   {
-    [Language.cpp]: [
-      { packName: "e/f", version: undefined },
-      { packName: "g/h", version: "1.2.3" },
-    ],
+    [Language.cpp]: ["e/f", "g/h@1.2.3"],
   }
 );
 
@@ -1664,12 +1848,7 @@ test(
   " +e/f, g/h@1.2.3 ",
   [Language.cpp],
   {
-    [Language.cpp]: [
-      { packName: "e/f", version: undefined },
-      { packName: "g/h", version: "1.2.3" },
-      { packName: "a/b", version: undefined },
-      { packName: "c/d", version: undefined },
-    ],
+    [Language.cpp]: ["e/f", "g/h@1.2.3", "a/b", "c/d"],
   }
 );
 
@@ -1679,6 +1858,7 @@ test(
   {},
   "c/d",
   [],
+  false,
   /No languages specified/
 );
 
@@ -1688,6 +1868,7 @@ test(
   {},
   "c/d",
   [Language.cpp, Language.csharp],
+  false,
   /multi-language analysis/
 );
 
@@ -1697,6 +1878,7 @@ test(
   {},
   " + ",
   [Language.cpp],
+  true,
   /remove the '\+'/
 );
 
@@ -1706,6 +1888,7 @@ test(
   {},
   " xxx",
   [Language.cpp],
+  false,
   /"xxx" is not a valid pack/
 );
 
@@ -1713,7 +1896,7 @@ const mlPoweredQueriesMacro = test.macro({
   exec: async (
     t: ExecutionContext,
     codeQLVersion: string,
-    isMlPoweredQueriesFlagEnabled: boolean,
+    isMlPoweredQueriesEnabled: boolean,
     packsInput: string | undefined,
     queriesInput: string | undefined,
     expectedVersionString: string | undefined
@@ -1732,6 +1915,9 @@ const mlPoweredQueriesMacro = test.macro({
             multipleDeclaredLanguages: {},
           };
         },
+        async packDownload(): Promise<PackDownloadOutput> {
+          return { packs: [] };
+        },
       });
 
       const { packs } = await configUtils.initConfig(
@@ -1740,30 +1926,26 @@ const mlPoweredQueriesMacro = test.macro({
         packsInput,
         undefined,
         undefined,
+        undefined,
+        false,
         false,
         "",
         "",
         { owner: "github", repo: "example " },
         tmpDir,
-        tmpDir,
         codeQL,
         tmpDir,
         gitHubVersion,
         sampleApiDetails,
-        createFeatureFlags(
-          isMlPoweredQueriesFlagEnabled
-            ? [FeatureFlag.MlPoweredQueriesEnabled]
-            : []
+        createFeatures(
+          isMlPoweredQueriesEnabled ? [Feature.MlPoweredQueriesEnabled] : []
         ),
         getRunnerLogger(true)
       );
       if (expectedVersionString !== undefined) {
         t.deepEqual(packs as unknown, {
           [Language.javascript]: [
-            {
-              packName: "codeql/javascript-experimental-atm-queries",
-              version: expectedVersionString,
-            },
+            `codeql/javascript-experimental-atm-queries@${expectedVersionString}`,
           ],
         });
       } else {
@@ -1774,7 +1956,7 @@ const mlPoweredQueriesMacro = test.macro({
   title: (
     _providedTitle: string | undefined,
     codeQLVersion: string,
-    isMlPoweredQueriesFlagEnabled: boolean,
+    isMlPoweredQueriesEnabled: boolean,
     packsInput: string | undefined,
     queriesInput: string | undefined,
     expectedVersionString: string | undefined
@@ -1783,22 +1965,13 @@ const mlPoweredQueriesMacro = test.macro({
       expectedVersionString !== undefined
         ? `${expectedVersionString} are`
         : "aren't"
-    } loaded for packs: ${packsInput}, queries: ${queriesInput} using CLI v${codeQLVersion} when feature flag is ${
-      isMlPoweredQueriesFlagEnabled ? "enabled" : "disabled"
+    } loaded for packs: ${packsInput}, queries: ${queriesInput} using CLI v${codeQLVersion} when feature is ${
+      isMlPoweredQueriesEnabled ? "enabled" : "disabled"
     }`,
 });
 
-// macro, codeQLVersion, isMlPoweredQueriesFlagEnabled, packsInput, queriesInput, expectedVersionString
-// Test that ML-powered queries aren't run on v2.7.4 of the CLI.
-test(
-  mlPoweredQueriesMacro,
-  "2.7.4",
-  true,
-  undefined,
-  "security-extended",
-  undefined
-);
-// Test that ML-powered queries aren't run when the feature flag is off.
+// macro, codeQLVersion, isMlPoweredQueriesEnabled, packsInput, queriesInput, expectedVersionString
+// Test that ML-powered queries aren't run when the feature is off.
 test(
   mlPoweredQueriesMacro,
   "2.7.5",
@@ -1807,42 +1980,575 @@ test(
   "security-extended",
   undefined
 );
-// Test that ML-powered queries aren't run when the user hasn't specified that we should run the
-// `security-extended` or `security-and-quality` query suite.
-test(mlPoweredQueriesMacro, "2.7.5", true, undefined, undefined, undefined);
-// Test that ML-powered queries are run on non-Windows platforms running `security-extended`.
+// Test that the ~0.1.0 version of ML-powered queries is run on v2.8.3 of the CLI.
 test(
   mlPoweredQueriesMacro,
-  "2.7.5",
+  "2.8.3",
   true,
   undefined,
   "security-extended",
   process.platform === "win32" ? undefined : "~0.1.0"
 );
-// Test that ML-powered queries are run on non-Windows platforms running `security-and-quality`.
+// Test that ML-powered queries aren't run when the user hasn't specified that we should run the
+// `security-extended` or `security-and-quality` query suite.
+test(mlPoweredQueriesMacro, "2.7.5", true, undefined, undefined, undefined);
+// Test that ML-powered queries are run on non-Windows platforms running `security-extended` on
+// versions of the CodeQL CLI prior to 2.9.0.
 test(
   mlPoweredQueriesMacro,
-  "2.7.5",
-  true,
-  undefined,
-  "security-and-quality",
-  process.platform === "win32" ? undefined : "~0.1.0"
-);
-// Test that we don't inject an ML-powered query pack if the user has already specified one.
-test(
-  mlPoweredQueriesMacro,
-  "2.7.5",
-  true,
-  "codeql/javascript-experimental-atm-queries@0.0.1",
-  "security-and-quality",
-  process.platform === "win32" ? undefined : "0.0.1"
-);
-// Test that the ~0.2.0 version of ML-powered queries is run on v2.8.4 of the CLI.
-test(
-  mlPoweredQueriesMacro,
-  "2.8.4",
+  "2.8.5",
   true,
   undefined,
   "security-extended",
   process.platform === "win32" ? undefined : "~0.2.0"
 );
+// Test that ML-powered queries are run on non-Windows platforms running `security-and-quality` on
+// versions of the CodeQL CLI prior to 2.9.0.
+test(
+  mlPoweredQueriesMacro,
+  "2.8.5",
+  true,
+  undefined,
+  "security-and-quality",
+  process.platform === "win32" ? undefined : "~0.2.0"
+);
+// Test that ML-powered queries are run on all platforms running `security-extended` on CodeQL CLI
+// 2.9.0+.
+test(
+  mlPoweredQueriesMacro,
+  "2.9.0",
+  true,
+  undefined,
+  "security-extended",
+  "~0.2.0"
+);
+// Test that ML-powered queries are run on all platforms running `security-and-quality` on CodeQL
+// CLI 2.9.0+.
+test(
+  mlPoweredQueriesMacro,
+  "2.9.0",
+  true,
+  undefined,
+  "security-and-quality",
+  "~0.2.0"
+);
+// Test that we don't inject an ML-powered query pack if the user has already specified one.
+test(
+  mlPoweredQueriesMacro,
+  "2.9.0",
+  true,
+  "codeql/javascript-experimental-atm-queries@0.0.1",
+  "security-and-quality",
+  "0.0.1"
+);
+// Test that ML-powered queries are run on all platforms running `security-extended` on CodeQL
+// CLI 2.9.3+.
+test(
+  mlPoweredQueriesMacro,
+  "2.9.3",
+  true,
+  undefined,
+  "security-extended",
+  "~0.3.0"
+);
+// Test that ML-powered queries are run on all platforms running `security-and-quality` on CodeQL
+// CLI 2.9.3+.
+test(
+  mlPoweredQueriesMacro,
+  "2.9.3",
+  true,
+  undefined,
+  "security-and-quality",
+  "~0.3.0"
+);
+// Test that ML-powered queries are run on all platforms running `security-extended` on CodeQL
+// CLI 2.11.3+.
+test(
+  mlPoweredQueriesMacro,
+  "2.11.3",
+  true,
+  undefined,
+  "security-extended",
+  "~0.4.0"
+);
+
+// Test that ML-powered queries are run on all platforms running `security-and-quality` on CodeQL
+// CLI 2.11.3+.
+test(
+  mlPoweredQueriesMacro,
+  "2.11.3",
+  true,
+  undefined,
+  "security-and-quality",
+  "~0.4.0"
+);
+
+const calculateAugmentationMacro = test.macro({
+  exec: async (
+    t: ExecutionContext,
+    _title: string,
+    rawPacksInput: string | undefined,
+    rawQueriesInput: string | undefined,
+    languages: Language[],
+    expectedAugmentationProperties: configUtils.AugmentationProperties
+  ) => {
+    const actualAugmentationProperties = configUtils.calculateAugmentation(
+      rawPacksInput,
+      rawQueriesInput,
+      languages
+    );
+    t.deepEqual(actualAugmentationProperties, expectedAugmentationProperties);
+  },
+  title: (_, title) => `Calculate Augmentation: ${title}`,
+});
+
+test(
+  calculateAugmentationMacro,
+  "All empty",
+  undefined,
+  undefined,
+  [Language.javascript],
+  {
+    queriesInputCombines: false,
+    queriesInput: undefined,
+    packsInputCombines: false,
+    packsInput: undefined,
+    injectedMlQueries: false,
+  } as configUtils.AugmentationProperties
+);
+
+test(
+  calculateAugmentationMacro,
+  "With queries",
+  undefined,
+  " a, b , c, d",
+  [Language.javascript],
+  {
+    queriesInputCombines: false,
+    queriesInput: [{ uses: "a" }, { uses: "b" }, { uses: "c" }, { uses: "d" }],
+    packsInputCombines: false,
+    packsInput: undefined,
+    injectedMlQueries: false,
+  } as configUtils.AugmentationProperties
+);
+
+test(
+  calculateAugmentationMacro,
+  "With queries combining",
+  undefined,
+  "   +   a, b , c, d ",
+  [Language.javascript],
+  {
+    queriesInputCombines: true,
+    queriesInput: [{ uses: "a" }, { uses: "b" }, { uses: "c" }, { uses: "d" }],
+    packsInputCombines: false,
+    packsInput: undefined,
+    injectedMlQueries: false,
+  } as configUtils.AugmentationProperties
+);
+
+test(
+  calculateAugmentationMacro,
+  "With packs",
+  "   codeql/a , codeql/b   , codeql/c  , codeql/d  ",
+  undefined,
+  [Language.javascript],
+  {
+    queriesInputCombines: false,
+    queriesInput: undefined,
+    packsInputCombines: false,
+    packsInput: ["codeql/a", "codeql/b", "codeql/c", "codeql/d"],
+    injectedMlQueries: false,
+  } as configUtils.AugmentationProperties
+);
+
+test(
+  calculateAugmentationMacro,
+  "With packs combining",
+  "   +   codeql/a, codeql/b, codeql/c, codeql/d",
+  undefined,
+  [Language.javascript],
+  {
+    queriesInputCombines: false,
+    queriesInput: undefined,
+    packsInputCombines: true,
+    packsInput: ["codeql/a", "codeql/b", "codeql/c", "codeql/d"],
+    injectedMlQueries: false,
+  } as configUtils.AugmentationProperties
+);
+
+const calculateAugmentationErrorMacro = test.macro({
+  exec: async (
+    t: ExecutionContext,
+    _title: string,
+    rawPacksInput: string | undefined,
+    rawQueriesInput: string | undefined,
+    languages: Language[],
+    expectedError: RegExp | string
+  ) => {
+    t.throws(
+      () =>
+        configUtils.calculateAugmentation(
+          rawPacksInput,
+          rawQueriesInput,
+          languages
+        ),
+      { message: expectedError }
+    );
+  },
+  title: (_, title) => `Calculate Augmentation Error: ${title}`,
+});
+
+test(
+  calculateAugmentationErrorMacro,
+  "Plus (+) with nothing else (queries)",
+  undefined,
+  "   +   ",
+  [Language.javascript],
+  /The workflow property "queries" is invalid/
+);
+
+test(
+  calculateAugmentationErrorMacro,
+  "Plus (+) with nothing else (packs)",
+  "   +   ",
+  undefined,
+  [Language.javascript],
+  /The workflow property "packs" is invalid/
+);
+
+test(
+  calculateAugmentationErrorMacro,
+  "Packs input with multiple languages",
+  "   +  a/b, c/d ",
+  undefined,
+  [Language.javascript, Language.java],
+  /Cannot specify a 'packs' input in a multi-language analysis/
+);
+
+test(
+  calculateAugmentationErrorMacro,
+  "Packs input with no languages",
+  "   +  a/b, c/d ",
+  undefined,
+  [],
+  /No languages specified/
+);
+
+test(
+  calculateAugmentationErrorMacro,
+  "Invalid packs",
+  " a-pack-without-a-scope ",
+  undefined,
+  [Language.javascript],
+  /"a-pack-without-a-scope" is not a valid pack/
+);
+
+test("downloadPacks-no-registries", async (t) => {
+  return await util.withTmpDir(async (tmpDir) => {
+    const packDownloadStub = sinon.stub();
+    packDownloadStub.callsFake((packs) => ({
+      packs,
+    }));
+    const codeQL = setCodeQL({
+      packDownload: packDownloadStub,
+    });
+    const logger = getRunnerLogger(true);
+
+    // packs are supplied for go, java, and python
+    // analyzed languages are java, javascript, and python
+    await configUtils.downloadPacks(
+      codeQL,
+      [Language.javascript, Language.java, Language.python],
+      {
+        java: ["a", "b"],
+        go: ["c", "d"],
+        python: ["e", "f"],
+      },
+      undefined, // registries
+      sampleApiDetails,
+      tmpDir,
+      logger
+    );
+
+    // Expecting packs to be downloaded once for java and once for python
+    t.deepEqual(packDownloadStub.callCount, 2);
+    // no config file was created, so pass `undefined` as the config file path
+    t.deepEqual(packDownloadStub.firstCall.args, [["a", "b"], undefined]);
+    t.deepEqual(packDownloadStub.secondCall.args, [["e", "f"], undefined]);
+  });
+});
+
+test("downloadPacks-with-registries", async (t) => {
+  // same thing, but this time include a registries block and
+  // associated env vars
+  return await util.withTmpDir(async (tmpDir) => {
+    process.env.GITHUB_TOKEN = "not-a-token";
+    process.env.CODEQL_REGISTRIES_AUTH = "not-a-registries-auth";
+    const logger = getRunnerLogger(true);
+
+    const registries = [
+      {
+        // no slash
+        url: "http://ghcr.io",
+        packages: ["codeql/*", "dsp-testing/*"],
+        token: "not-a-token",
+      },
+      {
+        // with slash
+        url: "https://containers.GHEHOSTNAME1/v2/",
+        packages: "semmle/*",
+        token: "still-not-a-token",
+      },
+    ];
+
+    // append a slash to the first url
+    const expectedRegistries = registries.map((r, i) => ({
+      packages: r.packages,
+      url: i === 0 ? `${r.url}/` : r.url,
+    }));
+
+    const expectedConfigFile = path.join(tmpDir, "qlconfig.yml");
+    const packDownloadStub = sinon.stub();
+    packDownloadStub.callsFake((packs, configFile) => {
+      t.deepEqual(configFile, expectedConfigFile);
+      // verify the env vars were set correctly
+      t.deepEqual(process.env.GITHUB_TOKEN, sampleApiDetails.auth);
+      t.deepEqual(
+        process.env.CODEQL_REGISTRIES_AUTH,
+        "http://ghcr.io=not-a-token,https://containers.GHEHOSTNAME1/v2/=still-not-a-token"
+      );
+
+      // verify the config file contents were set correctly
+      const config = yaml.load(fs.readFileSync(configFile, "utf8")) as {
+        registries: configUtils.RegistryConfigNoCredentials[];
+      };
+      t.deepEqual(config.registries, expectedRegistries);
+      return {
+        packs,
+      };
+    });
+
+    const codeQL = setCodeQL({
+      packDownload: packDownloadStub,
+      getVersion: () => Promise.resolve("2.10.5"),
+    });
+
+    // packs are supplied for go, java, and python
+    // analyzed languages are java, javascript, and python
+    await configUtils.downloadPacks(
+      codeQL,
+      [Language.javascript, Language.java, Language.python],
+      {
+        java: ["a", "b"],
+        go: ["c", "d"],
+        python: ["e", "f"],
+      },
+      registries,
+      sampleApiDetails,
+      tmpDir,
+      logger
+    );
+
+    // Same packs are downloaded as in previous test
+    t.deepEqual(packDownloadStub.callCount, 2);
+    t.deepEqual(packDownloadStub.firstCall.args, [
+      ["a", "b"],
+      expectedConfigFile,
+    ]);
+    t.deepEqual(packDownloadStub.secondCall.args, [
+      ["e", "f"],
+      expectedConfigFile,
+    ]);
+
+    // Verify that the env vars were unset.
+    t.deepEqual(process.env.GITHUB_TOKEN, "not-a-token");
+    t.deepEqual(process.env.CODEQL_REGISTRIES_AUTH, "not-a-registries-auth");
+  });
+});
+
+test("downloadPacks-with-registries fails on 2.10.3", async (t) => {
+  // same thing, but this time include a registries block and
+  // associated env vars
+  return await util.withTmpDir(async (tmpDir) => {
+    process.env.GITHUB_TOKEN = "not-a-token";
+    process.env.CODEQL_REGISTRIES_AUTH = "not-a-registries-auth";
+    const logger = getRunnerLogger(true);
+
+    const registries = [
+      {
+        url: "http://ghcr.io",
+        packages: ["codeql/*", "dsp-testing/*"],
+        token: "not-a-token",
+      },
+      {
+        url: "https://containers.GHEHOSTNAME1/v2/",
+        packages: "semmle/*",
+        token: "still-not-a-token",
+      },
+    ];
+
+    const codeQL = setCodeQL({
+      getVersion: () => Promise.resolve("2.10.3"),
+    });
+    await t.throwsAsync(
+      async () => {
+        return await configUtils.downloadPacks(
+          codeQL,
+          [Language.javascript, Language.java, Language.python],
+          {},
+          registries,
+          sampleApiDetails,
+          tmpDir,
+          logger
+        );
+      },
+      { instanceOf: Error },
+      "'registries' input is not supported on CodeQL versions less than 2.10.4."
+    );
+  });
+});
+
+test("downloadPacks-with-registries fails with invalid registries block", async (t) => {
+  // same thing, but this time include a registries block and
+  // associated env vars
+  return await util.withTmpDir(async (tmpDir) => {
+    process.env.GITHUB_TOKEN = "not-a-token";
+    process.env.CODEQL_REGISTRIES_AUTH = "not-a-registries-auth";
+    const logger = getRunnerLogger(true);
+
+    const registries = [
+      {
+        // missing url property
+        packages: ["codeql/*", "dsp-testing/*"],
+        token: "not-a-token",
+      },
+      {
+        url: "https://containers.GHEHOSTNAME1/v2/",
+        packages: "semmle/*",
+        token: "still-not-a-token",
+      },
+    ];
+
+    const codeQL = setCodeQL({
+      getVersion: () => Promise.resolve("2.10.4"),
+    });
+    await t.throwsAsync(
+      async () => {
+        return await configUtils.downloadPacks(
+          codeQL,
+          [Language.javascript, Language.java, Language.python],
+          {},
+          registries as any,
+          sampleApiDetails,
+          tmpDir,
+          logger
+        );
+      },
+      { instanceOf: Error },
+      "Invalid 'registries' input. Must be an array of objects with 'url' and 'packages' properties."
+    );
+  });
+});
+
+// getLanguages
+
+const mockRepositoryNwo = parseRepositoryNwo("owner/repo");
+// eslint-disable-next-line github/array-foreach
+[
+  {
+    name: "languages from input",
+    codeqlResolvedLanguages: ["javascript", "java", "python"],
+    languagesInput: "jAvAscript, \n jaVa",
+    languagesInRepository: ["SwiFt", "other"],
+    expectedLanguages: ["javascript", "java"],
+    expectedApiCall: false,
+  },
+  {
+    name: "languages from github api",
+    codeqlResolvedLanguages: ["javascript", "java", "python"],
+    languagesInput: "",
+    languagesInRepository: ["  jAvAscript\n \t", " jaVa", "SwiFt", "other"],
+    expectedLanguages: ["javascript", "java"],
+    expectedApiCall: true,
+  },
+  {
+    name: "aliases from input",
+    codeqlResolvedLanguages: ["javascript", "csharp", "cpp", "java", "python"],
+    languagesInput: "  typEscript\n \t, C#, c , KoTlin",
+    languagesInRepository: ["SwiFt", "other"],
+    expectedLanguages: ["javascript", "csharp", "cpp", "java"],
+    expectedApiCall: false,
+  },
+  {
+    name: "duplicate languages from input",
+    codeqlResolvedLanguages: ["javascript", "java", "python"],
+    languagesInput: "jAvAscript, \n jaVa, kotlin, typescript",
+    languagesInRepository: ["SwiFt", "other"],
+    expectedLanguages: ["javascript", "java"],
+    expectedApiCall: false,
+  },
+  {
+    name: "aliases from github api",
+    codeqlResolvedLanguages: ["javascript", "csharp", "cpp", "java", "python"],
+    languagesInput: "",
+    languagesInRepository: ["  typEscript\n \t", " C#", "c", "other"],
+    expectedLanguages: ["javascript", "csharp", "cpp"],
+    expectedApiCall: true,
+  },
+  {
+    name: "no languages",
+    codeqlResolvedLanguages: ["javascript", "java", "python"],
+    languagesInput: "",
+    languagesInRepository: [],
+    expectedApiCall: true,
+    expectedError: configUtils.getNoLanguagesError(),
+  },
+  {
+    name: "unrecognized languages from input",
+    codeqlResolvedLanguages: ["javascript", "java", "python"],
+    languagesInput: "a, b, c, javascript",
+    languagesInRepository: [],
+    expectedApiCall: false,
+    expectedError: configUtils.getUnknownLanguagesError(["a", "b"]),
+  },
+].forEach((args) => {
+  test(`getLanguages: ${args.name}`, async (t) => {
+    const mockRequest = mockLanguagesInRepo(args.languagesInRepository);
+    const languages = args.codeqlResolvedLanguages.reduce(
+      (acc, lang) => ({
+        ...acc,
+        [lang]: true,
+      }),
+      {}
+    );
+    const codeQL = setCodeQL({
+      resolveLanguages: () => Promise.resolve(languages),
+    });
+
+    if (args.expectedLanguages) {
+      // happy path
+      const actualLanguages = await configUtils.getLanguages(
+        codeQL,
+        args.languagesInput,
+        mockRepositoryNwo,
+        mockLogger
+      );
+
+      t.deepEqual(actualLanguages.sort(), args.expectedLanguages.sort());
+    } else {
+      // there is an error
+      await t.throwsAsync(
+        async () =>
+          await configUtils.getLanguages(
+            codeQL,
+            args.languagesInput,
+            mockRepositoryNwo,
+            mockLogger
+          ),
+        { message: args.expectedError }
+      );
+    }
+    t.deepEqual(mockRequest.called, args.expectedApiCall);
+  });
+});

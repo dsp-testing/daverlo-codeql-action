@@ -7,12 +7,12 @@ name: PR Check - RuboCop multi-language
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GO111MODULE: auto
+  CODEQL_EXTRACTOR_JAVA_AGENT_DISABLE_KOTLIN: 'true'
 on:
   push:
     branches:
     - main
-    - v1
-    - v2
+    - releases/v2
   pull_request:
     types:
     - opened
@@ -26,17 +26,7 @@ jobs:
       matrix:
         include:
         - os: ubuntu-latest
-          version: stable-20210308
-        - os: ubuntu-latest
-          version: stable-20210319
-        - os: ubuntu-latest
-          version: stable-20210809
-        - os: ubuntu-latest
           version: cached
-        - os: ubuntu-latest
-          version: latest
-        - os: ubuntu-latest
-          version: nightly-latest
     name: RuboCop multi-language
     timeout-minutes: 45
     runs-on: ${{ matrix.os }}
@@ -68,7 +58,5 @@ jobs:
     - uses: ./../action/upload-sarif
       with:
         sarif_file: rubocop.sarif
-      env:
-        TEST_MODE: true
     env:
-      INTERNAL_CODEQL_ACTION_DEBUG_LOC: true
+      CODEQL_ACTION_TEST_MODE: true

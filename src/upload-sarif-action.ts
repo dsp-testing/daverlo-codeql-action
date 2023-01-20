@@ -1,11 +1,15 @@
 import * as core from "@actions/core";
 
 import * as actionsUtil from "./actions-util";
-import { getGitHubVersionActionsOnly } from "./api-client";
 import { getActionsLogger } from "./logging";
 import { parseRepositoryNwo } from "./repository";
 import * as upload_lib from "./upload-lib";
-import { getRequiredEnvParam, initializeEnvironment, Mode } from "./util";
+import {
+  checkActionVersion,
+  getRequiredEnvParam,
+  initializeEnvironment,
+  isInTestMode,
+} from "./util";
 
 // eslint-disable-next-line import/no-commonjs
 const pkg = require("../package.json");
@@ -31,8 +35,9 @@ async function sendSuccessStatusReport(
 }
 
 async function run() {
-  initializeEnvironment(Mode.actions, pkg.version);
   const startedAt = new Date();
+  initializeEnvironment(pkg.version);
+  await checkActionVersion(pkg.version);
   if (
     !(await actionsUtil.sendStatusReport(
       await actionsUtil.createStatusReportBase(
@@ -46,25 +51,21 @@ async function run() {
   }
 
   try {
-    const apiDetails = {
-      auth: actionsUtil.getRequiredInput("token"),
-      url: getRequiredEnvParam("GITHUB_SERVER_URL"),
-    };
-
-    const gitHubVersion = await getGitHubVersionActionsOnly();
-
     const uploadResult = await upload_lib.uploadFromActions(
       actionsUtil.getRequiredInput("sarif_file"),
-      gitHubVersion,
-      apiDetails,
+      actionsUtil.getRequiredInput("checkout_path"),
+      actionsUtil.getOptionalInput("category"),
       getActionsLogger()
     );
     core.setOutput("sarif-id", uploadResult.sarifID);
-    if (actionsUtil.getRequiredInput("wait-for-processing") === "true") {
+
+    // We don't upload results in test mode, so don't wait for processing
+    if (isInTestMode()) {
+      core.debug("In test mode. Waiting for processing is disabled.");
+    } else if (actionsUtil.getRequiredInput("wait-for-processing") === "true") {
       await upload_lib.waitForProcessing(
         parseRepositoryNwo(getRequiredEnvParam("GITHUB_REPOSITORY")),
         uploadResult.sarifID,
-        apiDetails,
         getActionsLogger()
       );
     }
